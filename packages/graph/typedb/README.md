@@ -2,13 +2,15 @@
 
 [TypeDB](https://typedb.com) graph database adapter for [cognee](https://github.com/topoteretes/cognee).
 
-> **Status: work in progress.** Cognee contract conformance and the full
-> node/edge CRUD tier (add/get/delete nodes and edges, traversal,
-> `get_graph_data`, raw TypeQL via `query()`) are implemented and
-> integration-tested against a live TypeDB 3.x server. The analytics tier
-> (`get_graph_metrics`, `get_nodeset_subgraph`, `get_neighborhood`,
-> `get_disconnected_nodes`, `get_filtered_graph_data`) still raises
-> `NotImplementedError`.
+> **Status: work in progress.** The full `GraphDBInterface` surface is
+> implemented — node/edge CRUD, traversal, raw TypeQL via `query()` (with
+> `given`-based parameters), and the analytics tier (`get_graph_metrics`,
+> `get_nodeset_subgraph`, `get_neighborhood`, `get_disconnected_nodes`,
+> `get_filtered_graph_data`) — and integration-tested against a live
+> TypeDB 3.x server. The full `add → cognify → search` pipeline has not yet
+> been exercised end-to-end with an LLM; Cypher-generating search types are
+> cleanly unsupported (`supports_cypher_queries = False`), with a TypeQL
+> natural-language retriever planned.
 
 ## Requirements
 
