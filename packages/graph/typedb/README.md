@@ -2,10 +2,12 @@
 
 [TypeDB](https://typedb.com) graph database adapter for [cognee](https://github.com/topoteretes/cognee).
 
-> **Status: work in progress.** The package scaffold, cognee contract
-> conformance (registration, constructor, and full `GraphDBInterface` call
-> surface), and connection plumbing are in place. The graph operations
-> themselves are being implemented; methods that are not ready yet raise
+> **Status: work in progress.** Cognee contract conformance and the full
+> node/edge CRUD tier (add/get/delete nodes and edges, traversal,
+> `get_graph_data`, raw TypeQL via `query()`) are implemented and
+> integration-tested against a live TypeDB 3.x server. The analytics tier
+> (`get_graph_metrics`, `get_nodeset_subgraph`, `get_neighborhood`,
+> `get_disconnected_nodes`, `get_filtered_graph_data`) still raises
 > `NotImplementedError`.
 
 ## Requirements
@@ -37,11 +39,13 @@ from cognee_community_graph_adapter_typedb import register
 cognee.config.set_graph_database_provider("typedb")
 register()
 
-cognee.config.set_graph_db_config({
-    "graph_database_url": "127.0.0.1:1729",
-    "graph_database_username": "admin",
-    "graph_database_password": "password",
-})
+cognee.config.set_graph_db_config(
+    {
+        "graph_database_url": "127.0.0.1:1729",
+        "graph_database_username": "admin",
+        "graph_database_password": "password",
+    }
+)
 ```
 
 See `examples/example.py` for the full `add → cognify → search` flow.
@@ -61,4 +65,5 @@ follow-up.
 
 ```bash
 uv run pytest tests/unit -q     # offline contract tests, no server needed
+uv run pytest tests -q          # + CRUD integration tests (needs TypeDB on 127.0.0.1:1729)
 ```

@@ -18,7 +18,7 @@ dependencies = [
     "instructor>=1.11"
 ]
 readme = "README.md"
-requires-python = ">=3.10,<=3.13"
+requires-python = ">=3.10,<3.14"
 
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"
@@ -30,6 +30,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cognee_community_graph_adapter_typedb"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100

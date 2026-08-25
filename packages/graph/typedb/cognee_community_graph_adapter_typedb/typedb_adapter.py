@@ -10,11 +10,19 @@ follow-up.
 The TypeDB Python driver is synchronous (the async Rust core stops at the
 FFI boundary), while cognee's ``GraphDBInterface`` is fully async. Every
 adapter method therefore scopes its driver work (open transaction ->
-queries -> commit/close) inside a single ``asyncio.to_thread`` hop.
+queries -> commit/close) inside a single ``asyncio.to_thread`` hop. Batch
+methods pipeline all their queries through one transaction, using the
+driver's promise API to avoid per-query round trips.
+
+Not yet implemented (analytics tier): get_disconnected_nodes,
+get_neighborhood, get_model_independent_graph_data, get_nodeset_subgraph,
+get_filtered_graph_data, get_graph_metrics.
 """
 
 import asyncio
 import json
+import re
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -69,7 +77,12 @@ define
 """
 
 _SCHEMA_KEYWORDS = ("define", "undefine", "redefine")
-_WRITE_KEYWORDS = ("insert", "put", "update", "delete")
+# Word-boundary match, applied only after string literals and comments are
+# stripped, so reads over e.g. `updated_at` or values like "deleted" are not
+# misclassified as writes.
+_WRITE_STAGE_RE = re.compile(r"\b(insert|put|update|delete)\b")
+_STRING_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+_COMMENT_RE = re.compile(r"#[^\n]*")
 
 
 class TypeDBAdapter(GraphDBInterface):
@@ -119,6 +132,21 @@ class TypeDBAdapter(GraphDBInterface):
             )
         return self._driver
 
+    def _close_sync(self) -> None:
+        if self._driver is not None:
+            self._driver.close()
+            self._driver = None
+            self._schema_initialized = False
+
+    async def close(self) -> None:
+        """Release the native TypeDB connection.
+
+        Called by cognee's engine cache on eviction (prune, dataset deletion);
+        without it the gRPC connection would leak until GC.
+        """
+        async with self._lock:
+            await asyncio.to_thread(self._close_sync)
+
     def _ensure_database_sync(self) -> None:
         """Create the database and define the cognee schema if needed."""
         from typedb.driver import TransactionType
@@ -141,44 +169,171 @@ class TypeDBAdapter(GraphDBInterface):
     def _transaction_type_for(self, query_text: str):
         from typedb.driver import TransactionType
 
-        first_word = query_text.lstrip().split(None, 1)[0].lower() if query_text.strip() else ""
+        bare = _COMMENT_RE.sub(" ", _STRING_LITERAL_RE.sub(" ", query_text))
+        first_word = bare.lstrip().split(None, 1)[0].lower() if bare.strip() else ""
         if first_word in _SCHEMA_KEYWORDS:
             return TransactionType.SCHEMA
-        if first_word in _WRITE_KEYWORDS or any(
-            keyword in query_text.lower() for keyword in _WRITE_KEYWORDS
-        ):
+        if _WRITE_STAGE_RE.search(bare):
             return TransactionType.WRITE
         return TransactionType.READ
 
-    def _query_sync(self, query_text: str) -> list[dict[str, Any]]:
-        """Run one TypeQL query in its own transaction and return plain data."""
+    def _execute_batch_sync(self, queries: list[str], transaction_type) -> list[list[dict]]:
+        """Run queries in order within one transaction; commit unless READ.
+
+        Query promises are all fired before any is resolved, so round trips
+        are pipelined server-side while execution order is preserved. In a
+        multi-query write batch the answers' row streams are not iterated:
+        a later write in the same transaction interrupts earlier answer
+        streams (TSV13), and write results are unused anyway — resolve()
+        still surfaces per-query errors.
+        """
         from typedb.driver import TransactionType
 
         driver = self._get_driver()
-        transaction_type = self._transaction_type_for(query_text)
+        collect_rows = transaction_type == TransactionType.READ or len(queries) == 1
         with driver.transaction(self.database_name, transaction_type) as tx:
-            answer = tx.query(query_text).resolve()
-            results = self._collect_answer(answer)
-            if transaction_type in (TransactionType.WRITE, TransactionType.SCHEMA):
+            promises = [tx.query(query_text) for query_text in queries]
+            answers = [promise.resolve() for promise in promises]
+            results = (
+                [self._collect_answer(answer) for answer in answers]
+                if collect_rows
+                else [[] for _ in answers]
+            )
+            if transaction_type != TransactionType.READ:
                 tx.commit()
         return results
 
-    @staticmethod
-    def _collect_answer(answer) -> list[dict[str, Any]]:
+    async def _execute_batch(self, queries: list[str], write: bool = False) -> list[list[dict]]:
+        from typedb.driver import TransactionType
+
+        await self._ensure_database()
+        transaction_type = TransactionType.WRITE if write else TransactionType.READ
+        return await asyncio.to_thread(self._execute_batch_sync, queries, transaction_type)
+
+    def _query_sync(self, query_text: str) -> list[dict[str, Any]]:
+        """Run one TypeQL query in its own transaction and return plain data."""
+        return self._execute_batch_sync([query_text], self._transaction_type_for(query_text))[0]
+
+    @classmethod
+    def _concept_to_value(cls, concept) -> Any:
+        if concept is None:
+            return None
+        value = concept.try_get_value()
+        if value is not None:
+            return value
+        if concept.is_type():
+            return concept.get_label()
+        return concept.try_get_iid()
+
+    @classmethod
+    def _collect_answer(cls, answer) -> list[dict[str, Any]]:
         """Convert a QueryAnswer into a list of plain dicts.
 
-        Fetch queries yield JSON documents already; concept-row answers are
-        flattened to {column: string} for now (richer concept decoding lands
-        with the full implementation).
+        Fetch queries yield JSON documents; concept rows are decoded to raw
+        attribute/value payloads (types to labels, other instances to IIDs).
         """
         if answer.is_concept_documents():
             return list(answer.as_concept_documents())
         if answer.is_concept_rows():
-            rows = []
-            for row in answer.as_concept_rows():
-                rows.append({name: str(row.get(name)) for name in row.column_names()})
-            return rows
+            return [
+                {name: cls._concept_to_value(row.get(name)) for name in row.column_names()}
+                for row in answer.as_concept_rows()
+            ]
         return []
+
+    # ------------------------------------------------------------------
+    # TypeQL construction helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quote(value: Any) -> str:
+        """Render a value as a TypeQL string literal.
+
+        Control characters are replaced (TypeQL string escapes cover quotes
+        and backslashes; JSON-serialized payloads never contain raw newlines).
+        """
+        text = str(value)
+        text = re.sub(r"[\x00-\x1f]", " ", text)
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    @staticmethod
+    def _now_literal() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def _node_upsert_query(
+        self,
+        node_id: str,
+        node_type: str,
+        node_name: str | None,
+        properties_json: str,
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> str:
+        updates = [
+            f"  $n has node_type {self._quote(node_type)};",
+            f"  $n has properties_json {self._quote(properties_json)};",
+            f"  $n has updated_at {self._now_literal()};",
+        ]
+        if node_name is not None:
+            updates.append(f"  $n has node_name {self._quote(node_name)};")
+        if source_ref_key is not None:
+            updates.append(f"  $n has source_ref_key {self._quote(source_ref_key)};")
+        if pipeline_run_id is not None:
+            updates.append(f"  $n has pipeline_run_id {self._quote(pipeline_run_id)};")
+        return f"put $n isa node, has node_id {self._quote(node_id)};\nupdate\n" + "\n".join(
+            updates
+        )
+
+    def _edge_upsert_query(
+        self,
+        source_id: str,
+        target_id: str,
+        relationship_name: str,
+        properties_json: str,
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> str:
+        updates = [
+            f"  $e has properties_json {self._quote(properties_json)};",
+            f"  $e has updated_at {self._now_literal()};",
+        ]
+        if source_ref_key is not None:
+            updates.append(f"  $e has source_ref_key {self._quote(source_ref_key)};")
+        if pipeline_run_id is not None:
+            updates.append(f"  $e has pipeline_run_id {self._quote(pipeline_run_id)};")
+        return (
+            "match\n"
+            f"  $s isa node, has node_id {self._quote(source_id)};\n"
+            f"  $t isa node, has node_id {self._quote(target_id)};\n"
+            "put\n"
+            "  $e isa edge, links (source: $s, target: $t),"
+            f" has relationship_name {self._quote(relationship_name)};\n"
+            "update\n" + "\n".join(updates)
+        )
+
+    @staticmethod
+    def _document_to_node_dict(document: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild the cognee node property dict from a fetched `{ $n.* }` doc."""
+        properties = {}
+        raw = document.get("properties_json")
+        if raw:
+            try:
+                properties = json.loads(raw)
+            except (TypeError, ValueError):
+                logger.warning("Undecodable properties_json for node %s", document.get("node_id"))
+        properties.setdefault("id", document.get("node_id"))
+        if document.get("updated_at") is not None:
+            properties.setdefault("updated_at", document["updated_at"])
+        return properties
+
+    def _serialize_datapoint(self, node: DataPoint) -> tuple[str, str, str | None, str]:
+        properties = node.model_dump()
+        node_id = str(node.id)
+        node_type = str(properties.get("type") or type(node).__name__)
+        name = properties.get("name")
+        node_name = str(name) if name is not None else None
+        properties_json = json.dumps(properties, cls=JSONEncoder)
+        return node_id, node_type, node_name, properties_json
 
     # ------------------------------------------------------------------
     # GraphDBInterface — cognee 1.4.2 call surface
@@ -189,18 +344,41 @@ class TypeDBAdapter(GraphDBInterface):
 
         Note: cognee's Cypher-oriented search types pass Cypher here; this
         adapter executes TypeQL only (a TypeQL natural-language retriever is
-        planned alongside this adapter).
+        planned alongside this adapter). Query parameters are not supported:
+        pass a fully-formed TypeQL string (the TypeDB `given` stage is the
+        planned parameterization mechanism).
         """
         await self._ensure_database()
         if params:
-            raise NotImplementedError("TypeDBAdapter.query does not support query parameters yet")
+            raise ValueError(
+                "TypeDBAdapter.query takes a fully-formed TypeQL string and does not "
+                "support query parameters; interpolate values before calling."
+            )
         return await asyncio.to_thread(self._query_sync, query)
 
     async def has_node(self, node_id: str) -> bool:
-        raise NotImplementedError("TypeDBAdapter.has_node is not implemented yet")
+        results = await self._execute_batch(
+            [f"match $n isa node, has node_id {self._quote(str(node_id))}; reduce $count = count;"]
+        )
+        return bool(results[0] and results[0][0].get("count", 0) > 0)
 
     async def add_node(self, node: DataPoint | str, properties: dict[str, Any] | None = None):
-        raise NotImplementedError("TypeDBAdapter.add_node is not implemented yet")
+        """Add (or update) a single node from a DataPoint or an id + properties."""
+        if isinstance(node, DataPoint):
+            node_id, node_type, node_name, properties_json = self._serialize_datapoint(node)
+        else:
+            node_props = dict(properties or {})
+            node_id = str(node)
+            node_props.setdefault("id", node_id)
+            node_type = str(node_props.get("type", "node"))
+            name = node_props.get("name")
+            node_name = str(name) if name is not None else None
+            properties_json = json.dumps(node_props, cls=JSONEncoder)
+
+        await self._execute_batch(
+            [self._node_upsert_query(node_id, node_type, node_name, properties_json)],
+            write=True,
+        )
 
     async def add_nodes(
         self,
@@ -208,39 +386,87 @@ class TypeDBAdapter(GraphDBInterface):
         source_ref_key: str | None = None,
         pipeline_run_id: str | None = None,
     ) -> None:
-        raise NotImplementedError("TypeDBAdapter.add_nodes is not implemented yet")
+        """Upsert a batch of DataPoints in a single transaction."""
+        if not nodes:
+            return
+        queries = []
+        for node in nodes:
+            node_id, node_type, node_name, properties_json = self._serialize_datapoint(node)
+            queries.append(
+                self._node_upsert_query(
+                    node_id,
+                    node_type,
+                    node_name,
+                    properties_json,
+                    source_ref_key=source_ref_key,
+                    pipeline_run_id=str(pipeline_run_id) if pipeline_run_id else None,
+                )
+            )
+        await self._execute_batch(queries, write=True)
 
     async def extract_node(self, node_id: str):
-        raise NotImplementedError("TypeDBAdapter.extract_node is not implemented yet")
+        return await self.get_node(node_id)
 
     async def extract_nodes(self, node_ids: list[str]):
-        raise NotImplementedError("TypeDBAdapter.extract_nodes is not implemented yet")
+        return await self.get_nodes(node_ids)
 
     async def delete_node(self, node_id: str):
-        raise NotImplementedError("TypeDBAdapter.delete_node is not implemented yet")
+        await self.delete_nodes([node_id])
 
     async def delete_nodes(self, node_ids: list[str]) -> None:
-        raise NotImplementedError("TypeDBAdapter.delete_nodes is not implemented yet")
+        """Delete nodes and their incident edges in one transaction."""
+        if not node_ids:
+            return
+        queries = []
+        for node_id in node_ids:
+            quoted = self._quote(str(node_id))
+            # Edges first: deleting a player would leave a dangling edge.
+            queries.append(
+                f"match $n isa node, has node_id {quoted}; $e isa edge, links ($n); delete $e;"
+            )
+            queries.append(f"match $n isa node, has node_id {quoted}; delete $n;")
+        await self._execute_batch(queries, write=True)
 
-    async def has_edge(
-        self,
-        source_id: str | UUID,
-        target_id: str | UUID,
-        relationship_name: str,
-    ) -> bool:
-        raise NotImplementedError("TypeDBAdapter.has_edge is not implemented yet")
+    def _has_edge_query(self, source_id, target_id, relationship_name: str) -> str:
+        return (
+            "match"
+            f" $s isa node, has node_id {self._quote(str(source_id))};"
+            f" $t isa node, has node_id {self._quote(str(target_id))};"
+            " $e isa edge, links (source: $s, target: $t),"
+            f" has relationship_name {self._quote(relationship_name)};"
+            " reduce $count = count;"
+        )
+
+    async def has_edge(self, source_id, target_id, relationship_name: str) -> bool:
+        results = await self._execute_batch(
+            [self._has_edge_query(source_id, target_id, relationship_name)]
+        )
+        return bool(results[0] and results[0][0].get("count", 0) > 0)
 
     async def has_edges(self, edges):
-        raise NotImplementedError("TypeDBAdapter.has_edges is not implemented yet")
+        """Return the (source_id, target_id, relationship_name) tuples that exist.
+
+        Cognee consumes this as a list of existing edge tuples (see
+        retrieve_existing_edges), not as booleans.
+        """
+        if not edges:
+            return []
+        queries = [self._has_edge_query(edge[0], edge[1], edge[2]) for edge in edges]
+        results = await self._execute_batch(queries)
+        return [
+            (str(edge[0]), str(edge[1]), edge[2])
+            for edge, result in zip(edges, results, strict=True)
+            if result and result[0].get("count", 0) > 0
+        ]
 
     async def add_edge(
         self,
-        source_id: str | UUID,
-        target_id: str | UUID,
+        source_id,
+        target_id,
         relationship_name: str,
         properties: dict[str, Any] | None = None,
     ):
-        raise NotImplementedError("TypeDBAdapter.add_edge is not implemented yet")
+        await self.add_edges([(str(source_id), str(target_id), relationship_name, properties)])
 
     async def add_edges(
         self,
@@ -248,22 +474,87 @@ class TypeDBAdapter(GraphDBInterface):
         source_ref_key: str | None = None,
         pipeline_run_id: str | None = None,
     ) -> None:
-        raise NotImplementedError("TypeDBAdapter.add_edges is not implemented yet")
+        """Upsert a batch of edges in a single transaction.
+
+        Edge identity is (source, target, relationship_name); properties are
+        replaced on re-add. Edges whose endpoints are missing are skipped
+        (cognee adds nodes before edges).
+        """
+        if not edges:
+            return
+        queries = []
+        for source_id, target_id, relationship_name, properties in edges:
+            edge_properties = {
+                **(properties or {}),
+                "source_node_id": str(source_id),
+                "target_node_id": str(target_id),
+                "relationship_name": relationship_name,
+            }
+            queries.append(
+                self._edge_upsert_query(
+                    str(source_id),
+                    str(target_id),
+                    relationship_name,
+                    json.dumps(edge_properties, cls=JSONEncoder),
+                    source_ref_key=source_ref_key,
+                    pipeline_run_id=str(pipeline_run_id) if pipeline_run_id else None,
+                )
+            )
+        await self._execute_batch(queries, write=True)
 
     async def get_edges(self, node_id: str):
-        raise NotImplementedError("TypeDBAdapter.get_edges is not implemented yet")
+        """All edges incident to a node, as (source_id, target_id, {relationship_name})."""
+        quoted = self._quote(str(node_id))
+        results = await self._execute_batch(
+            [
+                "match\n"
+                "  $e isa edge, links (source: $s, target: $t);\n"
+                f"  {{ $s has node_id {quoted}; }} or {{ $t has node_id {quoted}; }};\n"
+                "  $s has node_id $sid;\n"
+                "  $t has node_id $tid;\n"
+                "  $e has relationship_name $rel;\n"
+                'fetch { "source": $sid, "target": $tid, "relationship_name": $rel };'
+            ]
+        )
+        return [
+            (
+                document["source"],
+                document["target"],
+                {"relationship_name": document["relationship_name"]},
+            )
+            for document in results[0]
+        ]
 
-    async def get_disconnected_nodes(self) -> list[str]:
-        raise NotImplementedError("TypeDBAdapter.get_disconnected_nodes is not implemented yet")
+    def _neighbour_query(self, node_id: str, incoming: bool, edge_label: str | None = None) -> str:
+        """Fetch neighbour nodes (+ relationship) on one side of a node."""
+        anchor_role, neighbour_role = ("target", "source") if incoming else ("source", "target")
+        label_constraint = (
+            f", has relationship_name {self._quote(edge_label)}" if edge_label else ""
+        )
+        return (
+            "match\n"
+            f"  $n isa node, has node_id {self._quote(str(node_id))};\n"
+            f"  $e isa edge, links ({anchor_role}: $n, {neighbour_role}: $m){label_constraint};\n"
+            "  $e has relationship_name $rel;\n"
+            'fetch { "neighbour": { $m.* }, "relationship_name": $rel, "node": { $n.* } };'
+        )
 
-    async def get_predecessors(self, node_id: str, edge_label: str | None = None) -> list[str]:
-        raise NotImplementedError("TypeDBAdapter.get_predecessors is not implemented yet")
+    async def get_predecessors(self, node_id: str, edge_label: str | None = None) -> list:
+        results = await self._execute_batch([self._neighbour_query(node_id, True, edge_label)])
+        return [self._document_to_node_dict(doc["neighbour"]) for doc in results[0]]
 
-    async def get_successors(self, node_id: str, edge_label: str | None = None) -> list[str]:
-        raise NotImplementedError("TypeDBAdapter.get_successors is not implemented yet")
+    async def get_successors(self, node_id: str, edge_label: str | None = None) -> list:
+        results = await self._execute_batch([self._neighbour_query(node_id, False, edge_label)])
+        return [self._document_to_node_dict(doc["neighbour"]) for doc in results[0]]
 
     async def get_neighbors(self, node_id: str) -> list[dict[str, Any]]:
-        raise NotImplementedError("TypeDBAdapter.get_neighbors is not implemented yet")
+        results = await self._execute_batch(
+            [
+                self._neighbour_query(node_id, True),
+                self._neighbour_query(node_id, False),
+            ]
+        )
+        return [self._document_to_node_dict(doc["neighbour"]) for batch in results for doc in batch]
 
     async def get_neighborhood(
         self,
@@ -274,30 +565,90 @@ class TypeDBAdapter(GraphDBInterface):
         raise NotImplementedError("TypeDBAdapter.get_neighborhood is not implemented yet")
 
     async def get_node(self, node_id: str) -> dict[str, Any] | None:
-        raise NotImplementedError("TypeDBAdapter.get_node is not implemented yet")
+        nodes = await self.get_nodes([node_id])
+        return nodes[0] if nodes else None
 
     async def get_nodes(self, node_ids: list[str]) -> list[dict[str, Any]]:
-        raise NotImplementedError("TypeDBAdapter.get_nodes is not implemented yet")
+        if not node_ids:
+            return []
+        queries = [
+            (
+                f"match $n isa node, has node_id {self._quote(str(node_id))};\n"
+                'fetch { "node": { $n.* } };'
+            )
+            for node_id in node_ids
+        ]
+        results = await self._execute_batch(queries)
+        return [
+            self._document_to_node_dict(document["node"]) for batch in results for document in batch
+        ]
 
-    async def get_connections(self, node_id: str | UUID) -> list:
-        raise NotImplementedError("TypeDBAdapter.get_connections is not implemented yet")
+    async def get_connections(self, node_id) -> list:
+        """(neighbour, {relationship_name}, node) triples in edge direction order."""
+        results = await self._execute_batch(
+            [
+                self._neighbour_query(str(node_id), True),
+                self._neighbour_query(str(node_id), False),
+            ]
+        )
+        connections = []
+        for document in results[0]:  # incoming: neighbour -> node
+            connections.append(
+                (
+                    self._document_to_node_dict(document["neighbour"]),
+                    {"relationship_name": document["relationship_name"]},
+                    self._document_to_node_dict(document["node"]),
+                )
+            )
+        for document in results[1]:  # outgoing: node -> neighbour
+            connections.append(
+                (
+                    self._document_to_node_dict(document["node"]),
+                    {"relationship_name": document["relationship_name"]},
+                    self._document_to_node_dict(document["neighbour"]),
+                )
+            )
+        return connections
+
+    def _remove_connections_query(self, node_id: str, incoming: bool, edge_label: str) -> str:
+        anchor_role = "target" if incoming else "source"
+        return (
+            "match"
+            f" $n isa node, has node_id {self._quote(str(node_id))};"
+            f" $e isa edge, links ({anchor_role}: $n),"
+            f" has relationship_name {self._quote(edge_label)};"
+            " delete $e;"
+        )
 
     async def remove_connection_to_predecessors_of(
         self, node_ids: list[str], edge_label: str
     ) -> None:
-        raise NotImplementedError(
-            "TypeDBAdapter.remove_connection_to_predecessors_of is not implemented yet"
+        if not node_ids:
+            return
+        await self._execute_batch(
+            [self._remove_connections_query(node_id, True, edge_label) for node_id in node_ids],
+            write=True,
         )
 
     async def remove_connection_to_successors_of(
         self, node_ids: list[str], edge_label: str
     ) -> None:
-        raise NotImplementedError(
-            "TypeDBAdapter.remove_connection_to_successors_of is not implemented yet"
+        if not node_ids:
+            return
+        await self._execute_batch(
+            [self._remove_connections_query(node_id, False, edge_label) for node_id in node_ids],
+            write=True,
         )
 
     async def delete_graph(self):
-        raise NotImplementedError("TypeDBAdapter.delete_graph is not implemented yet")
+        """Remove all nodes and edges (the schema is kept)."""
+        await self._execute_batch(
+            [
+                "match $e isa edge; delete $e;",
+                "match $n isa node; delete $n;",
+            ],
+            write=True,
+        )
 
     def serialize_properties(self, properties=None) -> dict[str, Any]:
         """Serialize property values so they round-trip through TypeDB.
@@ -321,7 +672,41 @@ class TypeDBAdapter(GraphDBInterface):
         )
 
     async def get_graph_data(self):
-        raise NotImplementedError("TypeDBAdapter.get_graph_data is not implemented yet")
+        """All nodes and edges, keyed by cognee node id (UUID string)."""
+        results = await self._execute_batch(
+            [
+                'match $n isa node; fetch { "node": { $n.* } };',
+                "match\n"
+                "  $e isa edge, links (source: $s, target: $t);\n"
+                "  $s has node_id $sid;\n"
+                "  $t has node_id $tid;\n"
+                "  $e has relationship_name $rel;\n"
+                'fetch { "source": $sid, "target": $tid, "relationship_name": $rel,'
+                ' "edge": { $e.* } };',
+            ]
+        )
+        nodes = [
+            (document["node"]["node_id"], self._document_to_node_dict(document["node"]))
+            for document in results[0]
+        ]
+        edges = []
+        for document in results[1]:
+            edge_properties = {}
+            raw = document["edge"].get("properties_json")
+            if raw:
+                try:
+                    edge_properties = json.loads(raw)
+                except (TypeError, ValueError):
+                    logger.warning("Undecodable properties_json for an edge")
+            edges.append(
+                (
+                    document["source"],
+                    document["target"],
+                    document["relationship_name"],
+                    edge_properties,
+                )
+            )
+        return (nodes, edges)
 
     async def get_nodeset_subgraph(
         self,
@@ -338,4 +723,5 @@ class TypeDBAdapter(GraphDBInterface):
         raise NotImplementedError("TypeDBAdapter.get_graph_metrics is not implemented yet")
 
     async def is_empty(self) -> bool:
-        raise NotImplementedError("TypeDBAdapter.is_empty is not implemented yet")
+        results = await self._execute_batch(["match $n isa node; limit 1; reduce $count = count;"])
+        return bool(results[0] and results[0][0].get("count", 1) == 0)
