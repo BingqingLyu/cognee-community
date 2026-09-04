@@ -7,8 +7,9 @@
 > `given`-based parameters), and the analytics tier (`get_graph_metrics`,
 > `get_nodeset_subgraph`, `get_neighborhood`, `get_disconnected_nodes`,
 > `get_filtered_graph_data`) — and integration-tested against a live
-> TypeDB 3.x server. The full `add → cognify → search` pipeline has not yet
-> been exercised end-to-end with an LLM; Cypher-generating search types are
+> TypeDB 3.x server, and the full `add → cognify → search → visualize`
+> pipeline (`examples/example.py`) runs end-to-end with an LLM (validated
+> with Anthropic + local fastembed embeddings). Cypher-generating search types are
 > cleanly unsupported (`supports_cypher_queries = False`), with a TypeQL
 > natural-language retriever planned. Like most sibling adapters (kuzu,
 > turso, postgres), the optional legacy-deletion methods
