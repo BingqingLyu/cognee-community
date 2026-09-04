@@ -1,16 +1,19 @@
 """TypeDB graph database adapter for cognee.
 
-Maps cognee's property-graph model onto a generic, reified TypeDB schema:
-one ``node`` entity type and one ``edge`` relation type (see
-``COGNEE_SCHEMA``). Cognee's dynamic node labels and relationship names are
-stored as attributes; the full property payload is serialized into the
-``properties_json`` attribute, which is the canonical record — the promoted
-attributes (``node_type``, ``node_name``) exist only as query accelerators,
-mirror the JSON, and are always written together with it. The provenance
-attributes (``source_ref_key``, ``pipeline_run_id``) are stamps outside the
-payload: they are written only when a value is provided, so a later upsert
-without provenance preserves earlier stamps. A typed per-DataPoint schema
-mode is a planned follow-up.
+Maps cognee's property-graph model onto the reified TypeDB schema in
+``schema.tql``: one ``node`` entity type and one ``edge`` relation type
+(roles ``source``/``target``). Cognee's dynamic node labels and relationship names
+are stored as attributes; the full property payload is serialized into the
+``properties-json`` attribute, which is the canonical record — the promoted
+attributes (``node-type``, ``name``) exist only as query accelerators, mirror
+the JSON, and are always written together with it. Edges carry an explicit
+``edge-key`` (``"{source}|{target}|{relationship}"``) as their identity.
+
+Provenance attributes (``source-ref-key``, ``source-run-id``) are
+multi-valued stamps outside the payload: each write that provides a value
+adds it, so a node touched by several pipeline runs keeps every run id, and
+a write without provenance leaves existing stamps untouched. ``created-at``
+is set once, ``updated-at`` on every write (both ms since the epoch).
 
 Values reach the server through the TypeQL ``given`` stage (driver
 ``given_rows``), never by string interpolation, so queries are compiled once
@@ -32,6 +35,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import cache
 from itertools import product
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -49,47 +53,15 @@ DEFAULT_USERNAME = "admin"
 DEFAULT_PASSWORD = "password"
 DEFAULT_DATABASE = "cognee"
 
-# Generic reified graph schema. Cognee's node labels (DataPoint type names)
-# and edge relationship names are data here, not schema, so any pipeline
-# output fits without runtime schema migration. `from` is a reserved TypeQL
-# keyword, hence the `source`/`target` role names. `properties_json` is the
-# canonical node/edge payload; node_type/node_name are query accelerators
-# written in the same update and must never be edited independently.
-COGNEE_SCHEMA = """
-define
-  attribute node_id, value string;
-  attribute node_type, value string;
-  attribute node_name, value string;
-  attribute relationship_name, value string;
-  attribute properties_json, value string;
-  attribute source_ref_key, value string;
-  attribute pipeline_run_id, value string;
-  attribute updated_at, value datetime;
-
-  entity node,
-    owns node_id @key,
-    owns node_type,
-    owns node_name,
-    owns properties_json,
-    owns source_ref_key,
-    owns pipeline_run_id,
-    owns updated_at,
-    plays edge:source,
-    plays edge:target;
-
-  relation edge,
-    relates source,
-    relates target,
-    owns relationship_name,
-    owns properties_json,
-    owns source_ref_key,
-    owns pipeline_run_id,
-    owns updated_at;
-"""
+# The schema is the single source of truth in schema.tql (shipped with the
+# package). The define is idempotent and re-run on every fresh adapter, so
+# additive schema evolution reaches existing databases; incompatible changes
+# (e.g. new @key constraints) require a fresh database.
+COGNEE_SCHEMA = (Path(__file__).parent / "schema.tql").read_text(encoding="utf-8")
 
 _SCHEMA_KEYWORDS = ("define", "undefine", "redefine")
 # Word-boundary match, applied only after string literals and comments are
-# stripped, so reads over e.g. `updated_at` or values like "deleted" are not
+# stripped, so reads over e.g. `updated-at` or values like "deleted" are not
 # misclassified as writes.
 _WRITE_STAGE_RE = re.compile(r"\b(insert|put|update|delete)\b")
 _STRING_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
@@ -98,95 +70,117 @@ _COMMENT_RE = re.compile(r"#[^\n]*")
 # --- given-parameterized query templates -----------------------------------
 
 
-@cache
-def _node_upsert_template(with_ref: bool, with_run: bool) -> str:
-    """Node upsert pipeline; provenance clauses only when a value is given."""
-    given = ["$id: string", "$type: string", "$name: string", "$props: string", "$now: datetime"]
-    updates = [
-        "  $n has node_type == $type;",
-        "  $n has node_name == $name;",
-        "  $n has properties_json == $props;",
-        "  $n has updated_at == $now;",
-    ]
+def _provenance_stages(var: str, with_ref: bool, with_run: bool) -> tuple[list[str], list[str]]:
+    """Extra given declarations and insert statements for provenance stamps.
+
+    The stamps are @card(0..) so they are inserted (accumulated), not updated.
+    """
+    given, inserts = [], []
     if with_ref:
         given.append("$ref: string")
-        updates.append("  $n has source_ref_key == $ref;")
+        inserts.append(f"  {var} has source-ref-key == $ref;")
     if with_run:
         given.append("$run: string")
-        updates.append("  $n has pipeline_run_id == $run;")
-    return (
-        "given " + ", ".join(given) + ";\n"
-        "put $n isa node, has node_id == $id;\n"
-        "update\n" + "\n".join(updates)
-    )
+        inserts.append(f"  {var} has source-run-id == $run;")
+    return given, inserts
+
+
+@cache
+def _node_upsert_template(with_ref: bool, with_run: bool) -> str:
+    """Node upsert pipeline: put identity, replace mirrors, add provenance stamps."""
+    given = ["$id: string", "$type: string", "$name: string", "$props: string", "$now: integer"]
+    extra_given, inserts = _provenance_stages("$n", with_ref, with_run)
+    given += extra_given
+    stages = [
+        "given " + ", ".join(given) + ";",
+        "put $n isa node, has node-id == $id;",
+        "update",
+        "  $n has node-type == $type;",
+        "  $n has name == $name;",
+        "  $n has properties-json == $props;",
+        "  $n has updated-at == $now;",
+    ]
+    if inserts:
+        stages += ["insert", *inserts]
+    return "\n".join(stages)
 
 
 @cache
 def _edge_upsert_template(with_ref: bool, with_run: bool) -> str:
-    """Edge upsert pipeline; provenance clauses only when a value is given."""
+    """Edge upsert pipeline keyed on edge-key; endpoints must already exist."""
     given = [
+        "$key: string",
         "$sid: string",
         "$tid: string",
         "$rel: string",
         "$props: string",
-        "$now: datetime",
+        "$now: integer",
     ]
-    updates = [
-        "  $e has properties_json == $props;",
-        "  $e has updated_at == $now;",
+    extra_given, inserts = _provenance_stages("$e", with_ref, with_run)
+    given += extra_given
+    stages = [
+        "given " + ", ".join(given) + ";",
+        "match",
+        "  $s isa node, has node-id == $sid;",
+        "  $t isa node, has node-id == $tid;",
+        "put",
+        "  $e isa edge, links (source: $s, target: $t),",
+        "    has edge-key == $key, has relationship-name == $rel;",
+        "update",
+        "  $e has properties-json == $props;",
+        "  $e has updated-at == $now;",
     ]
-    if with_ref:
-        given.append("$ref: string")
-        updates.append("  $e has source_ref_key == $ref;")
-    if with_run:
-        given.append("$run: string")
-        updates.append("  $e has pipeline_run_id == $run;")
-    return (
-        "given " + ", ".join(given) + ";\n"
-        "match\n"
-        "  $s isa node, has node_id == $sid;\n"
-        "  $t isa node, has node_id == $tid;\n"
-        "put\n"
-        "  $e isa edge, links (source: $s, target: $t), has relationship_name == $rel;\n"
-        "update\n" + "\n".join(updates)
-    )
+    if inserts:
+        stages += ["insert", *inserts]
+    return "\n".join(stages)
 
 
-def _driver_now():
-    """The batch timestamp as the driver's Datetime.
+# created-at is set once. Kept as separate statements (run after the upsert
+# in the same transaction) rather than as trailing pipeline stages: a
+# negation-only `match not {...}` stage after `update` did not filter rows
+# that already carried created-at, re-stamping them on every write.
+_SET_NODE_CREATED_AT = """
+given $id: string, $now: integer;
+match $n isa node, has node-id == $id; not { $n has created-at $c; };
+insert $n has created-at == $now;
+"""
 
-    A plain Python datetime is deliberately not convertible by the driver's
-    given-row value conversion; only typedb.common.datetime.Datetime is.
-    """
-    from typedb.common.datetime import Datetime
+_SET_EDGE_CREATED_AT = """
+given $key: string, $now: integer;
+match $e isa edge, has edge-key == $key; not { $e has created-at $c; };
+insert $e has created-at == $now;
+"""
 
-    return Datetime.utcfromtimestamp(int(time.time()), 0)
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _edge_key(source_id: str, target_id: str, relationship_name: str) -> str:
+    return f"{source_id}|{target_id}|{relationship_name}"
 
 
 _FETCH_NODES = """
 given $id: string;
-match $n isa node, has node_id == $id;
+match $n isa node, has node-id == $id;
 fetch { "node": { $n.* } };
 """
 
 _HAS_EDGES = """
-given $sid: string, $tid: string, $rel: string;
-match
-  $s isa node, has node_id == $sid;
-  $t isa node, has node_id == $tid;
-  $e isa edge, links (source: $s, target: $t), has relationship_name == $rel;
+given $key: string, $sid: string, $tid: string, $rel: string;
+match $e isa edge, has edge-key == $key;
 fetch { "source": $sid, "target": $tid, "relationship_name": $rel };
 """
 
 _DELETE_INCIDENT_EDGES = """
 given $id: string;
-match $n isa node, has node_id == $id; $e isa edge, links ($n);
+match $n isa node, has node-id == $id; $e isa edge, links ($n);
 delete $e;
 """
 
 _DELETE_NODES = """
 given $id: string;
-match $n isa node, has node_id == $id;
+match $n isa node, has node-id == $id;
 delete $n;
 """
 
@@ -194,10 +188,10 @@ _INCIDENT_EDGES = """
 given $id: string;
 match
   $e isa edge, links (source: $s, target: $t);
-  { $s has node_id == $id; } or { $t has node_id == $id; };
-  $s has node_id $sid;
-  $t has node_id $tid;
-  $e has relationship_name $rel;
+  { $s has node-id == $id; } or { $t has node-id == $id; };
+  $s has node-id $sid;
+  $t has node-id $tid;
+  $e has relationship-name $rel;
 fetch {
   "source": $sid, "target": $tid, "relationship_name": $rel,
   "edge": { $e.* }, "source_node": { $s.* }, "target_node": { $t.* }
@@ -208,46 +202,46 @@ fetch {
 _NEIGHBOURS = """
 given $id: string{label_decl};
 match
-  $n isa node, has node_id == $id;
+  $n isa node, has node-id == $id;
   $e isa edge, links ({anchor_role}: $n, {neighbour_role}: $m){label_constraint};
-  $e has relationship_name $rel;
+  $e has relationship-name $rel;
 fetch {{ "neighbour": {{ $m.* }}, "relationship_name": $rel, "node": {{ $n.* }} }};
 """
 
 _REMOVE_LABELED_EDGES = """
 given $id: string, $label: string;
 match
-  $n isa node, has node_id == $id;
-  $e isa edge, links ({anchor_role}: $n), has relationship_name == $label;
+  $n isa node, has node-id == $id;
+  $e isa edge, links ({anchor_role}: $n), has relationship-name == $label;
 delete $e;
 """
 
-_ALL_NODE_IDS = "match $n isa node, has node_id $id; select $id;"
+_ALL_NODE_IDS = "match $n isa node, has node-id $id; select $id;"
 _ALL_EDGE_ENDPOINTS = """
 match
   $e isa edge, links (source: $s, target: $t);
-  $s has node_id $sid;
-  $t has node_id $tid;
+  $s has node-id $sid;
+  $t has node-id $tid;
 select $sid, $tid;
 """
 _ALL_NODES = 'match $n isa node; fetch { "node": { $n.* } };'
 _ALL_EDGES = """
 match
   $e isa edge, links (source: $s, target: $t);
-  $s has node_id $sid;
-  $t has node_id $tid;
-  $e has relationship_name $rel;
+  $s has node-id $sid;
+  $t has node-id $tid;
+  $e has relationship-name $rel;
 fetch { "source": $sid, "target": $tid, "relationship_name": $rel, "edge": { $e.* } };
 """
 _ISOLATED_NODE_IDS = """
 match
-  $n isa node, has node_id $id;
+  $n isa node, has node-id $id;
   not { $e isa edge, links ($n); };
 select $id;
 """
 
-# Filterable attributes promoted out of properties_json, usable server-side.
-_PROMOTED_FILTER_ATTRS = {"type": "node_type", "name": "node_name"}
+# Filterable attributes promoted out of properties-json, usable server-side.
+_PROMOTED_FILTER_ATTRS = {"type": "node-type", "name": "name"}
 
 
 class TypeDBAdapter(GraphDBInterface):
@@ -344,9 +338,9 @@ class TypeDBAdapter(GraphDBInterface):
         """Create the database if missing and (re)define the cognee schema.
 
         The define always runs: it is idempotent, and re-running it applies
-        additive COGNEE_SCHEMA evolution to pre-existing databases. (A
-        presence check was tried and reverted: substring matching misfired
-        on foreign types and silently froze the schema at its first version.)
+        additive schema evolution to pre-existing databases. (A presence
+        check was tried and reverted: substring matching misfired on foreign
+        types and silently froze the schema at its first version.)
         """
         from typedb.driver import TransactionType
 
@@ -474,25 +468,26 @@ class TypeDBAdapter(GraphDBInterface):
     def _document_to_node_dict(document: dict[str, Any]) -> dict[str, Any]:
         """Rebuild the cognee node property dict from a fetched `{ $n.* }` doc."""
         properties = {}
-        raw = document.get("properties_json")
+        raw = document.get("properties-json")
         if raw:
             try:
                 properties = json.loads(raw)
             except (TypeError, ValueError):
-                logger.warning("Undecodable properties_json for node %s", document.get("node_id"))
-        properties.setdefault("id", document.get("node_id"))
-        if document.get("updated_at") is not None:
-            properties.setdefault("updated_at", document["updated_at"])
+                logger.warning("Undecodable properties-json for node %s", document.get("node-id"))
+        properties.setdefault("id", document.get("node-id"))
+        for attribute, key in (("created-at", "created_at"), ("updated-at", "updated_at")):
+            if document.get(attribute) is not None:
+                properties.setdefault(key, document[attribute])
         return properties
 
     @staticmethod
     def _document_to_edge_properties(document: dict[str, Any]) -> dict[str, Any]:
-        raw = document.get("properties_json")
+        raw = document.get("properties-json")
         if raw:
             try:
                 return json.loads(raw)
             except (TypeError, ValueError):
-                logger.warning("Undecodable properties_json for an edge")
+                logger.warning("Undecodable properties-json for an edge")
         return {}
 
     @staticmethod
@@ -517,7 +512,7 @@ class TypeDBAdapter(GraphDBInterface):
             label_decl=", $label: string" if edge_label is not None else "",
             anchor_role=anchor_role,
             neighbour_role=neighbour_role,
-            label_constraint=", has relationship_name == $label" if edge_label is not None else "",
+            label_constraint=", has relationship-name == $label" if edge_label is not None else "",
         )
         row: dict[str, Any] = {"id": str(node_id)}
         if edge_label is not None:
@@ -539,7 +534,7 @@ class TypeDBAdapter(GraphDBInterface):
         ``params`` are forwarded as one ``given`` row, so a parameterized
         query declares a matching ``given`` stage, e.g.::
 
-            query('given $name: string; match $n isa node, has node_name == $name; '
+            query('given $name: string; match $n isa node, has name == $name; '
                   'fetch { "node": { $n.* } };', {"name": "cognee"})
 
         ``transaction_type`` ("read" | "write" | "schema") overrides the
@@ -567,8 +562,8 @@ class TypeDBAdapter(GraphDBInterface):
     async def add_node(self, node: DataPoint | str, properties: dict[str, Any] | None = None):
         """Add (or update) a single node from a DataPoint or an id + properties.
 
-        Carries no provenance, so existing source_ref_key/pipeline_run_id
-        stamps on the node are preserved.
+        Carries no provenance, so existing source-ref-key/source-run-id
+        stamps on the node are left untouched.
         """
         if isinstance(node, DataPoint):
             row = self._node_row(node)
@@ -576,8 +571,13 @@ class TypeDBAdapter(GraphDBInterface):
             node_props = dict(properties or {})
             node_props.setdefault("id", str(node))
             row = self._row_from_properties(str(node), node_props, "node")
-        row["now"] = _driver_now()
-        await self._write_batch([(_node_upsert_template(False, False), [row])])
+        row["now"] = _now_ms()
+        await self._write_batch(
+            [
+                (_node_upsert_template(False, False), [row]),
+                (_SET_NODE_CREATED_AT, [{"id": row["id"], "now": row["now"]}]),
+            ]
+        )
 
     async def add_nodes(
         self,
@@ -587,13 +587,13 @@ class TypeDBAdapter(GraphDBInterface):
     ) -> None:
         """Upsert a batch of DataPoints: one compiled query, one transaction.
 
-        Provenance stamps are written only when provided (None preserves any
-        existing stamps). Rows sharing a node id collapse to the last one, so
-        a batch never races itself on the node_id key.
+        Provenance stamps are added when provided (they accumulate per node).
+        Rows sharing a node id collapse to the last one, so a batch never
+        races itself on the node-id key.
         """
         if not nodes:
             return
-        now = _driver_now()
+        now = _now_ms()
         rows: dict[str, dict[str, Any]] = {}
         for node in nodes:
             row = self._node_row(node)
@@ -604,7 +604,10 @@ class TypeDBAdapter(GraphDBInterface):
                 row["run"] = str(pipeline_run_id)
             rows[row["id"]] = row
         template = _node_upsert_template(source_ref_key is not None, pipeline_run_id is not None)
-        await self._write_batch([(template, list(rows.values()))])
+        created_rows = [{"id": row["id"], "now": now} for row in rows.values()]
+        await self._write_batch(
+            [(template, list(rows.values())), (_SET_NODE_CREATED_AT, created_rows)]
+        )
 
     async def extract_node(self, node_id: str):
         return await self.get_node(node_id)
@@ -631,11 +634,19 @@ class TypeDBAdapter(GraphDBInterface):
         """Return the (source_id, target_id, relationship_name) tuples that exist.
 
         Cognee consumes this as a list of existing edge tuples (see
-        retrieve_existing_edges), not as booleans.
+        retrieve_existing_edges), not as booleans. Lookup is by edge-key.
         """
         if not edges:
             return []
-        rows = [{"sid": str(edge[0]), "tid": str(edge[1]), "rel": edge[2]} for edge in edges]
+        rows = [
+            {
+                "key": _edge_key(str(edge[0]), str(edge[1]), edge[2]),
+                "sid": str(edge[0]),
+                "tid": str(edge[1]),
+                "rel": edge[2],
+            }
+            for edge in edges
+        ]
         results = await self._read_batch([(_HAS_EDGES, rows)])
         # De-duplicate while preserving first-seen order.
         return list(
@@ -661,16 +672,16 @@ class TypeDBAdapter(GraphDBInterface):
     ) -> None:
         """Upsert a batch of edges: one compiled query, one transaction.
 
-        Edge identity is (source, target, relationship_name); properties are
-        replaced on re-add and duplicate identities within a batch collapse
-        to the last row. Provenance stamps are written only when provided.
-        Edges whose endpoints are missing are skipped (cognee adds nodes
-        before edges).
+        Edge identity is the edge-key "{source}|{target}|{relationship}";
+        properties are replaced on re-add and duplicate identities within a
+        batch collapse to the last row. Provenance stamps are added when
+        provided. Edges whose endpoints are missing are skipped (cognee adds
+        nodes before edges).
         """
         if not edges:
             return
-        now = _driver_now()
-        rows: dict[tuple[str, str, str], dict[str, Any]] = {}
+        now = _now_ms()
+        rows: dict[str, dict[str, Any]] = {}
         for source_id, target_id, relationship_name, properties in edges:
             edge_properties = {
                 **(properties or {}),
@@ -678,7 +689,9 @@ class TypeDBAdapter(GraphDBInterface):
                 "target_node_id": str(target_id),
                 "relationship_name": relationship_name,
             }
+            key = _edge_key(str(source_id), str(target_id), relationship_name)
             row: dict[str, Any] = {
+                "key": key,
                 "sid": str(source_id),
                 "tid": str(target_id),
                 "rel": relationship_name,
@@ -689,9 +702,12 @@ class TypeDBAdapter(GraphDBInterface):
                 row["ref"] = source_ref_key
             if pipeline_run_id is not None:
                 row["run"] = str(pipeline_run_id)
-            rows[(row["sid"], row["tid"], row["rel"])] = row
+            rows[key] = row
         template = _edge_upsert_template(source_ref_key is not None, pipeline_run_id is not None)
-        await self._write_batch([(template, list(rows.values()))])
+        created_rows = [{"key": key, "now": now} for key in rows]
+        await self._write_batch(
+            [(template, list(rows.values())), (_SET_EDGE_CREATED_AT, created_rows)]
+        )
 
     async def get_edges(self, node_id: str):
         """Edges incident to a node, anchor-first: (node_id, neighbour_id, {...}).
@@ -720,7 +736,7 @@ class TypeDBAdapter(GraphDBInterface):
         return [self._document_to_node_dict(doc["neighbour"]) for doc in results[0]]
 
     async def get_neighbors(self, node_id: str) -> list[dict[str, Any]]:
-        """Predecessors and successors combined, keyed on the node_id attribute
+        """Predecessors and successors combined, keyed on the node-id attribute
         (never the payload's "id", which callers may set independently)."""
         anchor = str(node_id)
         results = await self._read_batch(
@@ -734,7 +750,7 @@ class TypeDBAdapter(GraphDBInterface):
             self._document_to_node_dict(doc["neighbour"])
             for doc in results[1]
             # A self-loop is already reported by the incoming pass.
-            if doc["neighbour"].get("node_id") != anchor
+            if doc["neighbour"].get("node-id") != anchor
         )
         return neighbours
 
@@ -782,7 +798,7 @@ class TypeDBAdapter(GraphDBInterface):
             [(_FETCH_NODES, [{"id": str(node_id)} for node_id in dict.fromkeys(node_ids)])]
         )
         nodes: dict[str, dict] = {
-            doc["node"]["node_id"]: self._document_to_node_dict(doc["node"]) for doc in seed_docs[0]
+            doc["node"]["node-id"]: self._document_to_node_dict(doc["node"]) for doc in seed_docs[0]
         }
 
         edge_docs: list[dict[str, Any]] = []
@@ -841,7 +857,7 @@ class TypeDBAdapter(GraphDBInterface):
             )
         anchor = str(node_id)
         for document in results[1]:  # outgoing: node -> neighbour
-            if document["neighbour"].get("node_id") == anchor:
+            if document["neighbour"].get("node-id") == anchor:
                 continue  # self-loop already reported by the incoming pass
             connections.append(
                 (
@@ -884,7 +900,7 @@ class TypeDBAdapter(GraphDBInterface):
         """Serialize property values so they round-trip through TypeDB.
 
         UUIDs become strings; nested dicts/lists become JSON strings (they are
-        stored inside the `properties_json` attribute).
+        stored inside the `properties-json` attribute).
         """
         serialized = {}
         for key, value in (properties or {}).items():
@@ -917,7 +933,7 @@ class TypeDBAdapter(GraphDBInterface):
         """All nodes and edges, keyed by cognee node id (UUID string)."""
         node_docs, edge_docs = await self._get_all_graph_documents()
         nodes = [
-            (document["node"]["node_id"], self._document_to_node_dict(document["node"]))
+            (document["node"]["node-id"], self._document_to_node_dict(document["node"]))
             for document in node_docs
         ]
         edges = [
@@ -948,13 +964,13 @@ class TypeDBAdapter(GraphDBInterface):
         label = node_type.__name__
         seed_query = """
         given $label: string, $name: string;
-        match $n isa node, has node_type == $label, has node_name == $name;
+        match $n isa node, has node-type == $label, has name == $name;
         fetch { "node": { $n.* } };
         """
         seed_rows = [{"label": label, "name": name} for name in node_name]
         seed_docs = (await self._read_batch([(seed_query, seed_rows)]))[0]
         seeds = {
-            doc["node"]["node_id"]: self._document_to_node_dict(doc["node"]) for doc in seed_docs
+            doc["node"]["node-id"]: self._document_to_node_dict(doc["node"]) for doc in seed_docs
         }
         if not seeds:
             return ([], [])
@@ -996,7 +1012,7 @@ class TypeDBAdapter(GraphDBInterface):
         a node matches when every filtered attribute has an allowed value.
         Filters over the promoted attributes ("type", "name") with string
         values run server-side; anything else falls back to a client-side
-        scan of the canonical properties_json payload.
+        scan of the canonical properties-json payload.
         """
         filters = {attribute: list(values) for attribute, values in attribute_filters[0].items()}
         promoted = (
@@ -1036,7 +1052,7 @@ class TypeDBAdapter(GraphDBInterface):
         ]
         documents = (await self._read_batch([(query, rows)]))[0]
         return {
-            doc["node"]["node_id"]: self._document_to_node_dict(doc["node"]) for doc in documents
+            doc["node"]["node-id"]: self._document_to_node_dict(doc["node"]) for doc in documents
         }
 
     async def _edge_endpoint_pairs(self) -> tuple[list[str], list[tuple[str, str]]]:

@@ -1,0 +1,29 @@
+define
+  attribute node-id value string;
+  attribute name value string;
+  attribute node-type value string;          # DataPoint.type (class-name string)
+  attribute relationship-name value string;
+  attribute properties-json value string;    # JSON blob of remaining fields
+  attribute created-at value integer;        # ms epoch ('long' does not exist in TypeDB 3)
+  attribute updated-at value integer;
+  attribute edge-key value string;           # "{source}|{target}|{rel}" MERGE identity
+  attribute source-ref-key value string;
+  attribute source-dataset-id value string;
+  attribute source-run-id value string;
+  attribute metadata-key value string;  attribute metadata-value value string;
+
+  entity node,
+    owns node-id @key, owns name, owns node-type,
+    owns properties-json, owns created-at, owns updated-at,
+    owns source-ref-key @card(0..), owns source-dataset-id @card(0..),
+    owns source-run-id @card(0..),
+    plays edge:source, plays edge:target;
+
+  relation edge,
+    relates source, relates target,
+    owns edge-key @key, owns relationship-name,
+    owns properties-json, owns created-at, owns updated-at,
+    owns source-ref-key @card(0..), owns source-dataset-id @card(0..),
+    owns source-run-id @card(0..);
+
+  entity graph-metadata, owns metadata-key @key, owns metadata-value;

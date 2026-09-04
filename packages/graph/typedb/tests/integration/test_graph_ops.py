@@ -41,21 +41,20 @@ async def test_delete_graph_keeps_schema_usable(seeded):
 async def test_raw_typeql_query(seeded):
     rows = await seeded.adapter.query("match $n isa node; reduce $count = count;")
     assert rows[0]["count"] == 3
-    # Reads mentioning updated_at must not be misclassified as writes.
+    # Reads mentioning updated-at must not be misclassified as writes.
     rows = await seeded.adapter.query(
-        "match $n isa node, has updated_at $t; reduce $count = count($t);"
+        "match $n isa node, has updated-at $t; reduce $count = count($t);"
     )
     assert rows[0]["count"] == 3
 
 
 async def test_query_params_via_given(seeded):
     rows = await seeded.adapter.query(
-        "given $name: string; match $n isa node, has node_name == $name; "
-        'fetch { "node": { $n.* } };',
+        'given $name: string; match $n isa node, has name == $name; fetch { "node": { $n.* } };',
         {"name": "machine learning"},
     )
     assert len(rows) == 1
-    assert rows[0]["node"]["node_id"] == seeded.ml
+    assert rows[0]["node"]["node-id"] == seeded.ml
 
 
 async def test_query_params_without_given_stage_is_rejected(seeded):

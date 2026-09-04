@@ -106,12 +106,19 @@ from the main cognee repository.
 ### How the graph is modeled
 
 TypeDB is schema-first while cognee's graph is a dynamic property graph, so
-the adapter uses a generic reified schema: a single `node` entity type and a
-single `edge` relation type (roles `source`/`target`). Cognee's node labels
-and relationship names are stored as `node_type`/`relationship_name`
-attributes, and the full property payload is serialized into a
-`properties_json` attribute, which is the canonical record. A typed
-per-DataPoint schema mode is a planned follow-up.
+the adapter uses the reified schema in `schema.tql`: a single `node` entity
+type and a single `edge` relation type (roles `source`/`target`). Cognee's node
+labels and relationship names are stored as `node-type`/`relationship-name`
+attributes, the full property payload is serialized into `properties-json`
+(the canonical record), and each edge carries an explicit
+`edge-key` (`"{source}|{target}|{relationship}"`) as its identity.
+Provenance stamps (`source-ref-key`, `source-run-id`) are multi-valued and
+accumulate across pipeline runs; `created-at`/`updated-at` are epoch
+milliseconds. A typed per-DataPoint schema mode is a planned follow-up.
+
+The schema define is idempotent and re-applied on every fresh adapter, so
+additive schema changes reach existing databases; incompatible changes need
+a fresh database.
 
 ### Limitations
 
