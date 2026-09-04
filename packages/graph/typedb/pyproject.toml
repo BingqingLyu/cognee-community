@@ -3,7 +3,7 @@ name = "cognee-community-graph-adapter-typedb"
 version = "0.1.0"
 description = "TypeDB graph database adapter for cognee"
 authors = [
-    {name = "Cognee Team", email = "hello@cognee.ai"},
+    {name = "TypeDB"},
 ]
 dependencies = [
     "cognee==1.4.2",
