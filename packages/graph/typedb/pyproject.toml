@@ -20,6 +20,12 @@ dependencies = [
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"
 Repository = "https://github.com/topoteretes/cognee-community"
@@ -33,6 +39,7 @@ packages = ["cognee_community_graph_adapter_typedb"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 100

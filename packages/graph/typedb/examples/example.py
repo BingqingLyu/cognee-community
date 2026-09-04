@@ -22,9 +22,9 @@ async def main():
     # Set up your TypeDB connection (TypeDB 3.x, default credentials shown)
     cognee.config.set_graph_db_config(
         {
-            "graph_database_url": os.environ.get("GRAPH_DB_URL", "127.0.0.1:1729"),
-            "graph_database_username": os.environ.get("GRAPH_DB_USERNAME", "admin"),
-            "graph_database_password": os.environ.get("GRAPH_DB_PASSWORD", "password"),
+            "graph_database_url": os.environ.get("GRAPH_DATABASE_URL", "127.0.0.1:1729"),
+            "graph_database_username": os.environ.get("GRAPH_DATABASE_USERNAME", "admin"),
+            "graph_database_password": os.environ.get("GRAPH_DATABASE_PASSWORD", "password"),
         }
     )
 

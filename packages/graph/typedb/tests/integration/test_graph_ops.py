@@ -85,3 +85,29 @@ async def test_concurrent_readers_and_writers(adapter):
         adapter.get_nodes([node_id]),
     )
     assert results[0] is True
+
+
+async def test_cognee_factory_constructs_registered_adapter(adapter):
+    """The register() + set_graph_db_config() + get_graph_engine() path cognee
+    users take must yield a working TypeDBAdapter."""
+    import cognee
+    from cognee.infrastructure.databases.graph import get_graph_engine
+
+    from cognee_community_graph_adapter_typedb import TypeDBAdapter, register
+
+    register()
+    cognee.config.set_graph_database_provider("typedb")
+    cognee.config.set_graph_db_config(
+        {
+            "graph_database_url": adapter.address,
+            "graph_database_username": adapter.username,
+            "graph_database_password": adapter.password,
+            "graph_database_name": adapter.database_name,
+        }
+    )
+
+    engine = await get_graph_engine()
+    assert isinstance(engine, TypeDBAdapter)
+    assert engine.database_name == adapter.database_name
+    await engine.add_nodes([Concept(name="via factory")])
+    assert await adapter.has_node(str((await engine.get_graph_data())[0][0][0]))

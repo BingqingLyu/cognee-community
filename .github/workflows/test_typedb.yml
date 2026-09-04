@@ -62,6 +62,6 @@ jobs:
 
       - name: Run TypeDB Adapter Tests
         env:
-          GRAPH_DB_URL: '127.0.0.1:1729'
+          GRAPH_DATABASE_URL: '127.0.0.1:1729'
         working-directory: ./packages/graph/typedb
         run: poetry run pytest tests -q

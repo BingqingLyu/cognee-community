@@ -35,3 +35,19 @@ def test_constructor_defaults():
     assert adapter.address == "127.0.0.1:1729"
     assert adapter.username == "admin"
     assert adapter.database_name == "cognee"
+
+
+def test_register_module_import_registers_provider():
+    # Run in a subprocess: importing the side-effect module shadows the
+    # package-level register() function for the rest of the process.
+    import subprocess
+    import sys
+
+    code = (
+        "import cognee_community_graph_adapter_typedb.register\n"
+        "from cognee.infrastructure.databases.graph.supported_databases import "
+        "supported_databases\n"
+        "from cognee_community_graph_adapter_typedb import TypeDBAdapter\n"
+        "assert supported_databases['typedb'] is TypeDBAdapter\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

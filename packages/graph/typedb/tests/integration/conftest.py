@@ -1,6 +1,6 @@
 """Shared fixtures for integration tests against a real TypeDB server.
 
-Tests are skipped when no server listens on 127.0.0.1:1729 (or GRAPH_DB_URL).
+Tests are skipped when no server listens on 127.0.0.1:1729 (or GRAPH_DATABASE_URL).
 No LLM or embedding secrets are needed.
 """
 
@@ -14,7 +14,7 @@ from cognee.infrastructure.engine import DataPoint
 
 from cognee_community_graph_adapter_typedb import TypeDBAdapter
 
-ADDRESS = os.environ.get("GRAPH_DB_URL", "127.0.0.1:1729")
+ADDRESS = os.environ.get("GRAPH_DATABASE_URL", "127.0.0.1:1729")
 
 
 def _server_available() -> bool:
