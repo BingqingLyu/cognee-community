@@ -52,3 +52,5 @@ select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
 "__init__.py" = ["F401"]
 # RUF012: pydantic model fields on DataPoint subclasses are not class vars.
 "tests/**" = ["RUF012"]
+# Benchmark scripts: pydantic fields, long print lines, small lambdas.
+"benchmarks/**" = ["RUF012", "E501", "E731"]

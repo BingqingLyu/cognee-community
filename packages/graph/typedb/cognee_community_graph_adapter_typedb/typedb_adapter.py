@@ -121,8 +121,8 @@ def _edge_upsert_template(with_ref: bool, with_run: bool) -> str:
     stages = [
         "given " + ", ".join(given) + ";",
         "match",
-        "  $s isa node, has node-id == $sid;",
-        "  $t isa node, has node-id == $tid;",
+        "  $sa isa node-id == $sid; $s isa node, has $sa;",
+        "  $ta isa node-id == $tid; $t isa node, has $ta;",
         "put",
         "  $e isa edge, links (source: $s, target: $t),",
         "    has edge-key == $key, has relationship-name == $rel;",
@@ -141,13 +141,13 @@ def _edge_upsert_template(with_ref: bool, with_run: bool) -> str:
 # that already carried created-at, re-stamping them on every write.
 _SET_NODE_CREATED_AT = """
 given $id: string, $now: integer;
-match $n isa node, has node-id == $id; not { $n has created-at $c; };
+match $a isa node-id == $id; $n isa node, has $a; not { $n has created-at $c; };
 insert $n has created-at == $now;
 """
 
 _SET_EDGE_CREATED_AT = """
 given $key: string, $now: integer;
-match $e isa edge, has edge-key == $key; not { $e has created-at $c; };
+match $k isa edge-key == $key; $e isa edge, has $k; not { $e has created-at $c; };
 insert $e has created-at == $now;
 """
 
@@ -162,39 +162,55 @@ def _edge_key(source_id: str, target_id: str, relationship_name: str) -> str:
 
 _FETCH_NODES = """
 given $id: string;
-match $n isa node, has node-id == $id;
+match $a isa node-id == $id; $n isa node, has $a;
 fetch { "node": { $n.* } };
 """
 
 _HAS_EDGES = """
 given $key: string, $sid: string, $tid: string, $rel: string;
-match $e isa edge, has edge-key == $key;
+match $k isa edge-key == $key; $e isa edge, has $k;
 fetch { "source": $sid, "target": $tid, "relationship_name": $rel };
 """
 
 _DELETE_INCIDENT_EDGES = """
 given $id: string;
-match $n isa node, has node-id == $id; $e isa edge, links ($n);
+match $a isa node-id == $id; $n isa node, has $a; $e isa edge, links ($n);
 delete $e;
 """
 
 _DELETE_NODES = """
 given $id: string;
-match $n isa node, has node-id == $id;
+match $a isa node-id == $id; $n isa node, has $a;
 delete $n;
 """
 
-_INCIDENT_EDGES = """
+# Incident edges of an anchor node, one query per role the anchor plays (an
+# `or` over the role is 12-18x slower than two directional queries — see
+# benchmarks/README.md). Both produce the same document shape; self-loops
+# appear in both and consumers de-duplicate by (source, target, rel).
+_INCIDENT_EDGES_OUT = """
 given $id: string;
 match
-  $e isa edge, links (source: $s, target: $t);
-  { $s has node-id == $id; } or { $t has node-id == $id; };
-  $s has node-id $sid;
-  $t has node-id $tid;
+  $a isa node-id == $id; $n isa node, has $a;
+  $e isa edge, links (source: $n, target: $m);
+  $m has node-id $mid;
   $e has relationship-name $rel;
 fetch {
-  "source": $sid, "target": $tid, "relationship_name": $rel,
-  "edge": { $e.* }, "source_node": { $s.* }, "target_node": { $t.* }
+  "source": $id, "target": $mid, "relationship_name": $rel,
+  "edge": { $e.* }, "source_node": { $n.* }, "target_node": { $m.* }
+};
+"""
+
+_INCIDENT_EDGES_IN = """
+given $id: string;
+match
+  $a isa node-id == $id; $n isa node, has $a;
+  $e isa edge, links (source: $m, target: $n);
+  $m has node-id $mid;
+  $e has relationship-name $rel;
+fetch {
+  "source": $mid, "target": $id, "relationship_name": $rel,
+  "edge": { $e.* }, "source_node": { $m.* }, "target_node": { $n.* }
 };
 """
 
@@ -202,7 +218,7 @@ fetch {
 _NEIGHBOURS = """
 given $id: string{label_decl};
 match
-  $n isa node, has node-id == $id;
+  $a isa node-id == $id; $n isa node, has $a;
   $e isa edge, links ({anchor_role}: $n, {neighbour_role}: $m){label_constraint};
   $e has relationship-name $rel;
 fetch {{ "neighbour": {{ $m.* }}, "relationship_name": $rel, "node": {{ $n.* }} }};
@@ -211,7 +227,7 @@ fetch {{ "neighbour": {{ $m.* }}, "relationship_name": $rel, "node": {{ $n.* }} 
 _REMOVE_LABELED_EDGES = """
 given $id: string, $label: string;
 match
-  $n isa node, has node-id == $id;
+  $a isa node-id == $id; $n isa node, has $a;
   $e isa edge, links ({anchor_role}: $n), has relationship-name == $label;
 delete $e;
 """
@@ -239,6 +255,13 @@ match
   not { $e isa edge, links ($n); };
 select $id;
 """
+
+# Batch writes are split into transactions of this many rows, with up to
+# WRITE_CONCURRENCY transactions in flight (see benchmarks/README.md: cost
+# grows with rows per transaction, and concurrent transactions scale ~2-3x).
+WRITE_CHUNK_ROWS = 200
+WRITE_CONCURRENCY = 4
+COMMIT_RETRIES = 6
 
 # Filterable attributes promoted out of properties-json, usable server-side.
 _PROMOTED_FILTER_ATTRS = {"type": "node-type", "name": "name"}
@@ -428,6 +451,42 @@ class TypeDBAdapter(GraphDBInterface):
             self._run_batch_sync, self._as_specs(queries), TransactionType.WRITE, False
         )
 
+    async def _write_batch_with_retry(self, queries) -> None:
+        """_write_batch, retrying TypeDB commit isolation conflicts (STC2).
+
+        Concurrent transactions conflict at commit even on disjoint ids; the
+        upserts are idempotent, so replaying the whole batch is safe.
+        """
+        for attempt in range(COMMIT_RETRIES):
+            try:
+                await self._write_batch(queries)
+                return
+            except Exception as error:
+                if "STC2" not in str(error) or attempt + 1 == COMMIT_RETRIES:
+                    raise
+                await asyncio.sleep(0.02 * (2**attempt))
+
+    async def _write_rows(self, template: str, rows: list[dict], created_query: str, key: str):
+        """Upsert rows in chunked transactions, WRITE_CONCURRENCY at a time.
+
+        Each chunk runs the upsert query followed by the set-once created-at
+        statement in one transaction.
+        """
+        if not rows:
+            return
+        chunks = [rows[i : i + WRITE_CHUNK_ROWS] for i in range(0, len(rows), WRITE_CHUNK_ROWS)]
+        semaphore = asyncio.Semaphore(WRITE_CONCURRENCY)
+
+        async def write(chunk):
+            specs = [
+                (template, chunk),
+                (created_query, [{key: row[key], "now": row["now"]} for row in chunk]),
+            ]
+            async with semaphore:
+                await self._write_batch_with_retry(specs)
+
+        await asyncio.gather(*(write(chunk) for chunk in chunks))
+
     def _query_sync(self, query_text: str, given_rows) -> list[dict[str, Any]]:
         """Run one raw query in its own transaction, inferring the type."""
         transaction_type = self._transaction_type_for(query_text)
@@ -585,7 +644,7 @@ class TypeDBAdapter(GraphDBInterface):
         source_ref_key: str | None = None,
         pipeline_run_id: str | None = None,
     ) -> None:
-        """Upsert a batch of DataPoints: one compiled query, one transaction.
+        """Upsert a batch of DataPoints in chunked, concurrent transactions.
 
         Provenance stamps are added when provided (they accumulate per node).
         Rows sharing a node id collapse to the last one, so a batch never
@@ -604,10 +663,7 @@ class TypeDBAdapter(GraphDBInterface):
                 row["run"] = str(pipeline_run_id)
             rows[row["id"]] = row
         template = _node_upsert_template(source_ref_key is not None, pipeline_run_id is not None)
-        created_rows = [{"id": row["id"], "now": now} for row in rows.values()]
-        await self._write_batch(
-            [(template, list(rows.values())), (_SET_NODE_CREATED_AT, created_rows)]
-        )
+        await self._write_rows(template, list(rows.values()), _SET_NODE_CREATED_AT, "id")
 
     async def extract_node(self, node_id: str):
         return await self.get_node(node_id)
@@ -670,7 +726,7 @@ class TypeDBAdapter(GraphDBInterface):
         source_ref_key: str | None = None,
         pipeline_run_id: str | None = None,
     ) -> None:
-        """Upsert a batch of edges: one compiled query, one transaction.
+        """Upsert a batch of edges in chunked, concurrent transactions.
 
         Edge identity is the edge-key "{source}|{target}|{relationship}";
         properties are replaced on re-add and duplicate identities within a
@@ -704,10 +760,7 @@ class TypeDBAdapter(GraphDBInterface):
                 row["run"] = str(pipeline_run_id)
             rows[key] = row
         template = _edge_upsert_template(source_ref_key is not None, pipeline_run_id is not None)
-        created_rows = [{"key": key, "now": now} for key in rows]
-        await self._write_batch(
-            [(template, list(rows.values())), (_SET_EDGE_CREATED_AT, created_rows)]
-        )
+        await self._write_rows(template, list(rows.values()), _SET_EDGE_CREATED_AT, "key")
 
     async def get_edges(self, node_id: str):
         """Edges incident to a node, anchor-first: (node_id, neighbour_id, {...}).
@@ -717,9 +770,8 @@ class TypeDBAdapter(GraphDBInterface):
         the neighbour, regardless of the edge's true direction.
         """
         anchor = str(node_id)
-        results = await self._read_batch([(_INCIDENT_EDGES, [{"id": anchor}])])
         seen: dict[tuple[str, str, str], None] = {}
-        for document in results[0]:
+        for document in await self._sweep_incident([anchor]):
             other = document["target"] if document["source"] == anchor else document["source"]
             seen[(anchor, other, document["relationship_name"])] = None
         return [
@@ -755,11 +807,15 @@ class TypeDBAdapter(GraphDBInterface):
         return neighbours
 
     async def _sweep_incident(self, node_ids) -> list[dict[str, Any]]:
-        """One _INCIDENT_EDGES fetch over the given node ids."""
+        """All edge documents incident to the given node ids (both directions)."""
         ids = sorted(set(node_ids))
         if not ids:
             return []
-        return (await self._read_batch([(_INCIDENT_EDGES, [{"id": i} for i in ids])]))[0]
+        rows = [{"id": i} for i in ids]
+        outgoing, incoming = await self._read_batch(
+            [(_INCIDENT_EDGES_OUT, rows), (_INCIDENT_EDGES_IN, rows)]
+        )
+        return outgoing + incoming
 
     @classmethod
     def _in_set_edges(
