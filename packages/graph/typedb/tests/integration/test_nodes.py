@@ -44,6 +44,28 @@ async def test_add_node_from_id_and_properties(adapter):
     assert node["kind"] == "manual"
 
 
+async def test_add_nodes_with_duplicate_ids_in_one_batch(adapter):
+    first = Concept(name="first")
+    second = Concept(id=first.id, name="second")
+    await adapter.add_nodes([first, second])
+    nodes = await adapter.get_nodes([str(first.id)])
+    assert len(nodes) == 1
+    assert nodes[0]["name"] == "second"  # last row wins
+
+
+async def test_unstamped_upsert_preserves_provenance(seeded):
+    # seeded stamped ds:test / run-1; a provenance-less re-add must not erase it.
+    ml = seeded.concepts["ml"]
+    await seeded.adapter.add_nodes([Concept(id=ml.id, name="machine learning")])
+    rows = await seeded.adapter.query(
+        "given $id: string; match $n isa node, has node_id == $id,"
+        " has source_ref_key $r, has pipeline_run_id $p;"
+        ' fetch { "ref": $r, "run": $p };',
+        {"id": seeded.ml},
+    )
+    assert rows == [{"ref": "ds:test", "run": "run-1"}]
+
+
 async def test_extract_node_aliases_get_node(seeded):
     node = await seeded.adapter.extract_node(seeded.ai)
     assert node["name"] == "artificial intelligence"

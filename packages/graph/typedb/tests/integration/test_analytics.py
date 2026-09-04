@@ -24,17 +24,20 @@ async def test_get_neighborhood_depth_and_edge_types(seeded):
     assert await adapter.get_neighborhood([]) == ([], [])
 
 
-async def test_get_disconnected_nodes(seeded):
+async def test_get_disconnected_nodes_returns_only_isolated(seeded):
     adapter = seeded.adapter
     assert await adapter.get_disconnected_nodes() == []
 
+    # Only degree-zero nodes count: cognee's remove_disconnected_chunks
+    # deletes every id returned here, so a connected pair — even one in its
+    # own small component — must NOT be reported.
     lonely = Concept(name="lonely")
     lonelier = Concept(name="lonelier")
-    await adapter.add_nodes([lonely, lonelier])
+    isolated = Concept(name="isolated")
+    await adapter.add_nodes([lonely, lonelier, isolated])
     await adapter.add_edge(str(lonely.id), str(lonelier.id), "commiserates_with")
 
-    disconnected = set(await adapter.get_disconnected_nodes())
-    assert disconnected == {str(lonely.id), str(lonelier.id)}
+    assert await adapter.get_disconnected_nodes() == [str(isolated.id)]
 
 
 async def test_get_graph_metrics(seeded):
@@ -71,11 +74,20 @@ async def test_get_nodeset_subgraph_or_and(seeded):
 
 
 async def test_get_filtered_graph_data(seeded):
+    # "name" is a promoted attribute, so this exercises the server-side path.
     nodes, edges = await seeded.adapter.get_filtered_graph_data(
         [{"name": ["machine learning", "artificial intelligence"]}]
     )
     assert {node_id for node_id, _ in nodes} == {seeded.ml, seeded.ai}
     assert {(source, target) for source, target, _, _ in edges} == {(seeded.ml, seeded.ai)}
+
+
+async def test_get_filtered_graph_data_client_side_fallback(seeded):
+    # "description" is not promoted, so this exercises the client-side scan.
+    nodes, _ = await seeded.adapter.get_filtered_graph_data(
+        [{"description": ['the "broad" field']}]
+    )
+    assert {node_id for node_id, _ in nodes} == {seeded.ai}
 
 
 async def test_get_model_independent_graph_data(seeded):

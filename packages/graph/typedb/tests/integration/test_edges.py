@@ -30,12 +30,14 @@ async def test_edge_upsert_does_not_duplicate(seeded):
     assert len(edges) == 2  # ml->ai (upserted), dl->ai
 
 
-async def test_get_edges_covers_both_directions(seeded):
+async def test_get_edges_is_anchor_first(seeded):
+    # Cognee's format_edges keys on slot 1 as the neighbour, so the queried
+    # node is always slot 0 regardless of the edge's true direction.
     edges = await seeded.adapter.get_edges(seeded.ml)
-    triples = {(source, target, rel["relationship_name"]) for source, target, rel in edges}
+    triples = {(first, second, rel["relationship_name"]) for first, second, rel in edges}
     assert triples == {
-        (seeded.ml, seeded.ai, "is_subset_of"),
-        (seeded.dl, seeded.ml, "is_subset_of"),
+        (seeded.ml, seeded.ai, "is_subset_of"),  # outgoing: ml -> ai
+        (seeded.ml, seeded.dl, "is_subset_of"),  # incoming dl -> ml, anchor-first
     }
 
 

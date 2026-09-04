@@ -10,7 +10,11 @@
 > TypeDB 3.x server. The full `add → cognify → search` pipeline has not yet
 > been exercised end-to-end with an LLM; Cypher-generating search types are
 > cleanly unsupported (`supports_cypher_queries = False`), with a TypeQL
-> natural-language retriever planned.
+> natural-language retriever planned. Like most sibling adapters (kuzu,
+> turso, postgres), the optional legacy-deletion methods
+> `get_document_subgraph` / `get_degree_one_nodes` are not implemented; that
+> path is only reachable for data ingested before cognee 1.4.x's relational
+> provenance ledger.
 
 ## Requirements
 
