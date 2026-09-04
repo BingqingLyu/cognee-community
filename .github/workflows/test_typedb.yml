@@ -1,0 +1,67 @@
+name: Test TypeDB Community Adapter
+
+# Runs the offline unit tier plus the CRUD/analytics integration tests
+# against a dockerized TypeDB 3.x server. No LLM or embedding secrets are
+# needed: the integration tier tests the adapter directly, not the full
+# cognify pipeline.
+
+on:
+  workflow_call:
+    inputs:
+      event-type:
+        required: false
+        type: string
+        default: "regular-testing-event"
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, dev ]
+    paths:
+      - 'packages/graph/typedb/**'
+
+concurrency:
+  group: typedb-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-typedb:
+    name: "TypeDB Community Adapter Test"
+    runs-on: ubuntu-22.04
+    services:
+      typedb:
+        # Pinned to the server version matching the typedb-driver pin; the
+        # adapter relies on the TypeQL `given` stage (3.12+).
+        image: typedb/typedb:3.12.3
+        ports:
+          - 1729:1729
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Community Setup
+        uses: ./.github/actions/community_setup
+        with:
+          python-version: '3.11.x'
+          package-path: packages/graph/typedb
+          event-type: ${{ inputs.event-type }}
+
+      - name: Wait for TypeDB
+        # Fail loudly if the server never comes up — the integration tests
+        # skip themselves when the port is closed, which must not read as
+        # a green run.
+        run: |
+          for i in {1..30}; do
+            if nc -z localhost 1729; then
+              echo "TypeDB is ready"
+              exit 0
+            fi
+            echo "Waiting for TypeDB..."
+            sleep 2
+          done
+          echo "TypeDB did not become ready" >&2
+          exit 1
+
+      - name: Run TypeDB Adapter Tests
+        env:
+          GRAPH_DB_URL: '127.0.0.1:1729'
+        working-directory: ./packages/graph/typedb
+        run: poetry run pytest tests -q
