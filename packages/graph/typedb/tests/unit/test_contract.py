@@ -51,3 +51,35 @@ def test_register_module_import_registers_provider():
         "assert supported_databases['typedb'] is TypeDBAdapter\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_register_adds_typedb_dataset_database_handler():
+    from cognee.infrastructure.databases.dataset_database_handler import (
+        supported_dataset_database_handlers,
+    )
+
+    from cognee_community_graph_adapter_typedb import TypeDBDatasetDatabaseHandler
+
+    register()
+    entry = supported_dataset_database_handlers["typedb"]
+    assert entry["handler_instance"] is TypeDBDatasetDatabaseHandler
+    assert entry["handler_provider"] == "typedb"
+
+
+def test_dataset_database_name_derivation_and_validation():
+    import uuid
+
+    import pytest
+
+    from cognee_community_graph_adapter_typedb import TypeDBDatasetDatabaseHandler
+
+    dataset_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    assert (
+        TypeDBDatasetDatabaseHandler._database_name_for_dataset(dataset_id)
+        == "cognee_12345678123456781234567812345678"
+    )
+    with pytest.raises(ValueError):
+        TypeDBDatasetDatabaseHandler._database_name_for_dataset(None)
+    for foreign in ("cognee", "typedb", "cognee_../x", "cognee_" + "a" * 70, ""):
+        with pytest.raises(ValueError):
+            TypeDBDatasetDatabaseHandler._validate_database_name(foreign)

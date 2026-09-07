@@ -54,3 +54,5 @@ select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
 "tests/**" = ["RUF012"]
 # Benchmark scripts: pydantic fields, long print lines, small lambdas.
 "benchmarks/**" = ["RUF012", "E501", "E731"]
+# Dataset handler module is CamelCase by cognee convention (Neo4jDatasetDatabaseHandler.py etc.).
+"cognee_community_graph_adapter_typedb/TypeDBDatasetDatabaseHandler.py" = ["N999"]

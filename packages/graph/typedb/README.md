@@ -86,6 +86,25 @@ export GRAPH_DATABASE_USERNAME="admin"
 export GRAPH_DATABASE_PASSWORD="password"
 ```
 
+### Multi-tenant / backend access control
+
+Cognee's backend access control (on by default in cognee 1.x) maps each
+dataset to its own graph database through a dataset database handler. This
+package registers one for TypeDB — one TypeDB database per dataset, named
+`cognee_<dataset uuid>` — under the handler key `typedb`. Select it alongside
+the provider:
+
+```bash
+export GRAPH_DATABASE_PROVIDER="typedb"
+export GRAPH_DATASET_DATABASE_HANDLER="typedb"
+```
+
+Without it, cognee falls back to its default (Ladybug) handler and refuses to
+run pipelines against the TypeDB provider unless
+`ENABLE_BACKEND_ACCESS_CONTROL=false`. Credentials are never stored in the
+dataset registry; they are resolved from the live config when a connection is
+opened.
+
 See [`.env.example`](.env.example) for a complete template (including an
 Anthropic + local-embeddings variant), or use the
 [`.env.template`](https://github.com/topoteretes/cognee/blob/main/.env.template)

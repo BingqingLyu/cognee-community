@@ -8,6 +8,10 @@ import asyncio
 import os
 import pathlib
 
+# Per-dataset TypeDB databases for cognee's backend access control (read at
+# engine creation, so it must be set before cognee builds its config).
+os.environ.setdefault("GRAPH_DATASET_DATABASE_HANDLER", "typedb")
+
 import cognee
 
 # NOTE: Importing register lets cognee know it can use the TypeDB graph adapter
@@ -60,7 +64,8 @@ async def main():
         print(f"{index}. {result}")
 
     print("\nVisualizing the graph...")
-    await cognee.visualize_graph(system_path / "graph.html")
+    # The dataset is required when backend access control (the default) is on.
+    await cognee.visualize_graph(system_path / "graph.html", dataset="typedb_knowledge")
     print(f"Graph visualization saved to {system_path / 'graph.html'}")
 
 
