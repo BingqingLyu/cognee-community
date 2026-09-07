@@ -113,8 +113,10 @@ attributes, the full property payload is serialized into `properties-json`
 (the canonical record), and each edge carries an explicit
 `edge-key` (`"{source}|{target}|{relationship}"`) as its identity.
 Provenance stamps (`source-ref-key`, `source-run-id`) are multi-valued and
-accumulate across pipeline runs; `created-at`/`updated-at` are epoch
-milliseconds. A typed per-DataPoint schema mode is a planned follow-up.
+accumulate across pipeline runs. Timestamps are epoch milliseconds: a node's
+`created-at` mirrors its DataPoint's own `created_at`, an edge's is set on
+first write, and `updated-at` is the write time. A typed per-DataPoint schema
+mode is a planned follow-up.
 
 The schema define is idempotent and re-applied on every fresh adapter, so
 additive schema changes reach existing databases; incompatible changes need

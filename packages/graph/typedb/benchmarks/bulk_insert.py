@@ -36,7 +36,6 @@ from cognee.infrastructure.engine import DataPoint
 from cognee_community_graph_adapter_typedb import TypeDBAdapter
 from cognee_community_graph_adapter_typedb.typedb_adapter import (
     _SET_EDGE_CREATED_AT,
-    _SET_NODE_CREATED_AT,
     _edge_key,
     _edge_upsert_template,
     _node_upsert_template,
@@ -111,13 +110,7 @@ def node_specs(adapter: TypeDBAdapter, nodes, chunk: int | None):
         rows.append(row)
     template = _node_upsert_template(True, True)
     size = chunk or len(rows)
-    return [
-        [
-            (template, rows[i : i + size]),
-            (_SET_NODE_CREATED_AT, [{"id": r["id"], "now": now} for r in rows[i : i + size]]),
-        ]
-        for i in range(0, len(rows), size)
-    ]
+    return [[(template, rows[i : i + size])] for i in range(0, len(rows), size)]
 
 
 def edge_specs(edges, chunk: int | None):

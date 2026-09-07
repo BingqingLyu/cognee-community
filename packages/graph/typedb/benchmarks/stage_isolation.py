@@ -17,17 +17,24 @@ import uuid
 from cognee_community_graph_adapter_typedb import TypeDBAdapter
 from cognee_community_graph_adapter_typedb.typedb_adapter import (
     _SET_EDGE_CREATED_AT,
-    _SET_NODE_CREATED_AT,
     _edge_key,
     _edge_upsert_template,
     _node_upsert_template,
     _now_ms,
 )
 
+# The set-once node statement the adapter used to run (kept here so the
+# measurement that motivated dropping it can be reproduced).
+_SET_NODE_CREATED_AT = """
+given $id: string, $now: integer;
+match $a isa node-id == $id; $n isa node, has $a; not { $n has created-at $c; };
+insert $n has created-at == $now;
+"""
+
 INSERT_NODES = """
-given $id: string, $type: string, $name: string, $props: string, $now: integer;
+given $id: string, $type: string, $name: string, $props: string, $created: integer, $now: integer;
 insert $n isa node, has node-id == $id, has node-type == $type, has name == $name,
-  has properties-json == $props, has updated-at == $now, has created-at == $now;
+  has properties-json == $props, has updated-at == $now, has created-at == $created;
 """
 PUT_ONLY = "given $id: string;\nput $n isa node, has node-id == $id;"
 PUT_UPDATE = _node_upsert_template(False, False)

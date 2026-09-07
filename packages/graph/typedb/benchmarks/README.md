@@ -66,18 +66,19 @@ the ratios are what matter.
   `WRITE_CHUNK_ROWS` (200) and run up to `WRITE_CONCURRENCY` (4) transactions
   concurrently, retrying `STC2` commit conflicts with backoff. A batch no
   longer commits atomically (neither do the sibling adapters' batches).
-- `created-at` set-once semantics are kept for now; they cap node writes at
-  ~800–1,900 rows/s. Options under discussion: mirror the DataPoint payload's
-  own `created_at` field (free; same "mirror the JSON" rule as
-  node-type/name), or pre-read existing ids and split insert/update.
+- Node `created-at` mirrors the DataPoint payload's own `created_at` (the
+  same "mirror the JSON" rule as node-type/name), written in the `update`
+  stage; the set-once negation statement — which capped node writes at
+  ~800–1,900 rows/s — is gone from the node path. Edges keep set-once
+  semantics (their payload carries no timestamp).
 
 ## Shipped adapter, before → after
 
 | | 1,000 nodes / 1,500 edges | 5,000 nodes / 7,500 edges |
 |---|---|---|
-| `add_nodes` | 672 → **1,475–1,935** rows/s | 842–889 rows/s |
-| `add_edges` | 157 → **913–1,101** rows/s | 256–279 rows/s |
-| re-upsert (update path) | 561 → 1,312 rows/s | 400 rows/s |
+| `add_nodes` | 672 → **~3,800** rows/s | ~1,700 rows/s |
+| `add_edges` | 157 → **~900–1,100** rows/s | ~260 rows/s |
+| re-upsert (update path) | 561 → ~2,200 rows/s | ~740 rows/s |
 | `get_neighborhood` (10 seeds, depth 2) | 1.97 s → **0.17 s** | 24.6 s → **1.19 s** |
 | `get_edges` (one node) | 40 ms → 4 ms | 10 ms |
 | `get_graph_data` | 27k rows/s | 25k rows/s |

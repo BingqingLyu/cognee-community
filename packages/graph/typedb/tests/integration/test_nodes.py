@@ -80,16 +80,16 @@ async def test_provenance_stamps_accumulate_and_survive_unstamped_upserts(seeded
     assert await stamps() == {("ds:test", "run-1"), ("ds:test", "run-2")}
 
 
-async def test_created_at_attribute_is_set_once_and_updated_at_moves(adapter):
-    """The TypeDB created-at/updated-at attributes (not the DataPoint payload's
-    own created_at/updated_at fields, which live inside properties-json)."""
+async def test_created_at_mirrors_payload_and_updated_at_moves(adapter):
+    """The TypeDB created-at attribute mirrors the DataPoint payload's own
+    created_at (epoch ms); updated-at is the write time."""
     import asyncio
 
     node = Concept(name="timestamps")
 
     async def stamps():
         rows = await adapter.query(
-            "given $id: string; match $n isa node, has node-id == $id,"
+            "given $id: string; match $a isa node-id == $id; $n isa node, has $a,"
             " has created-at $c, has updated-at $u; select $c, $u;",
             {"id": str(node.id)},
         )
@@ -98,13 +98,19 @@ async def test_created_at_attribute_is_set_once_and_updated_at_moves(adapter):
 
     await adapter.add_nodes([node])
     created, updated = await stamps()
-    assert isinstance(created, int) and created == updated
+    assert created == node.created_at
+    assert updated >= created
 
     await asyncio.sleep(0.01)
-    await adapter.add_nodes([Concept(id=node.id, name="timestamps", description="again")])
+    await adapter.add_nodes([node])  # same object: same created_at payload
     created_after, updated_after = await stamps()
-    assert created_after == created
+    assert created_after == node.created_at
     assert updated_after > updated
+
+    fresh = Concept(id=node.id, name="timestamps", description="rebuilt")
+    await adapter.add_nodes([fresh])  # new object for the same id: follows its payload
+    created_fresh, _ = await stamps()
+    assert created_fresh == fresh.created_at
 
 
 async def test_extract_node_aliases_get_node(seeded):

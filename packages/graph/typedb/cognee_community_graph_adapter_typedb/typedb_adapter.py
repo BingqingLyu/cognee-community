@@ -12,8 +12,9 @@ the JSON, and are always written together with it. Edges carry an explicit
 Provenance attributes (``source-ref-key``, ``source-run-id``) are
 multi-valued stamps outside the payload: each write that provides a value
 adds it, so a node touched by several pipeline runs keeps every run id, and
-a write without provenance leaves existing stamps untouched. ``created-at``
-is set once, ``updated-at`` on every write (both ms since the epoch).
+a write without provenance leaves existing stamps untouched. A node's
+``created-at`` mirrors its DataPoint payload's ``created_at``; an edge's is
+set once on first write; ``updated-at`` is the write time (all epoch ms).
 
 Values reach the server through the TypeQL ``given`` stage (driver
 ``given_rows``), never by string interpolation, so queries are compiled once
@@ -87,8 +88,15 @@ def _provenance_stages(var: str, with_ref: bool, with_run: bool) -> tuple[list[s
 
 @cache
 def _node_upsert_template(with_ref: bool, with_run: bool) -> str:
-    """Node upsert pipeline: put identity, replace mirrors, add provenance stamps."""
-    given = ["$id: string", "$type: string", "$name: string", "$props: string", "$now: integer"]
+    """Node upsert pipeline: put identity, replace mirrors (incl. created-at), stamp."""
+    given = [
+        "$id: string",
+        "$type: string",
+        "$name: string",
+        "$props: string",
+        "$created: integer",
+        "$now: integer",
+    ]
     extra_given, inserts = _provenance_stages("$n", with_ref, with_run)
     given += extra_given
     stages = [
@@ -98,6 +106,7 @@ def _node_upsert_template(with_ref: bool, with_run: bool) -> str:
         "  $n has node-type == $type;",
         "  $n has name == $name;",
         "  $n has properties-json == $props;",
+        "  $n has created-at == $created;",
         "  $n has updated-at == $now;",
     ]
     if inserts:
@@ -135,16 +144,12 @@ def _edge_upsert_template(with_ref: bool, with_run: bool) -> str:
     return "\n".join(stages)
 
 
-# created-at is set once. Kept as separate statements (run after the upsert
+# Edge created-at is set once via a separate statement (run after the upsert
 # in the same transaction) rather than as trailing pipeline stages: a
 # negation-only `match not {...}` stage after `update` did not filter rows
-# that already carried created-at, re-stamping them on every write.
-_SET_NODE_CREATED_AT = """
-given $id: string, $now: integer;
-match $a isa node-id == $id; $n isa node, has $a; not { $n has created-at $c; };
-insert $n has created-at == $now;
-"""
-
+# that already carried created-at, re-stamping them on every write. Nodes
+# need no such statement: their created-at mirrors the DataPoint payload's
+# own created_at (see _row_from_properties).
 _SET_EDGE_CREATED_AT = """
 given $key: string, $now: integer;
 match $k isa edge-key == $key; $e isa edge, has $k; not { $e has created-at $c; };
@@ -466,11 +471,17 @@ class TypeDBAdapter(GraphDBInterface):
                     raise
                 await asyncio.sleep(0.02 * (2**attempt))
 
-    async def _write_rows(self, template: str, rows: list[dict], created_query: str, key: str):
+    async def _write_rows(
+        self,
+        template: str,
+        rows: list[dict],
+        created_query: str | None = None,
+        key: str | None = None,
+    ):
         """Upsert rows in chunked transactions, WRITE_CONCURRENCY at a time.
 
-        Each chunk runs the upsert query followed by the set-once created-at
-        statement in one transaction.
+        When ``created_query`` is given, each chunk's transaction also runs
+        that set-once created-at statement after the upsert.
         """
         if not rows:
             return
@@ -478,10 +489,9 @@ class TypeDBAdapter(GraphDBInterface):
         semaphore = asyncio.Semaphore(WRITE_CONCURRENCY)
 
         async def write(chunk):
-            specs = [
-                (template, chunk),
-                (created_query, [{key: row[key], "now": row["now"]} for row in chunk]),
-            ]
+            specs = [(template, chunk)]
+            if created_query is not None:
+                specs.append((created_query, [{key: row[key], "now": row["now"]} for row in chunk]))
             async with semaphore:
                 await self._write_batch_with_retry(specs)
 
@@ -555,11 +565,15 @@ class TypeDBAdapter(GraphDBInterface):
     ) -> dict[str, Any]:
         """The shared given-row shape for a node upsert (no provenance keys)."""
         name = properties.get("name")
+        created = properties.get("created_at")
         return {
             "id": node_id,
             "type": str(properties.get("type") or fallback_type),
             "name": str(name) if name is not None else "",
             "props": json.dumps(properties, cls=JSONEncoder),
+            # Mirrors DataPoint.created_at (epoch ms). Payloads without one
+            # (add_node's dict form) get the write time.
+            "created": created if isinstance(created, int) else _now_ms(),
         }
 
     def _node_row(self, node: DataPoint) -> dict[str, Any]:
@@ -631,12 +645,7 @@ class TypeDBAdapter(GraphDBInterface):
             node_props.setdefault("id", str(node))
             row = self._row_from_properties(str(node), node_props, "node")
         row["now"] = _now_ms()
-        await self._write_batch(
-            [
-                (_node_upsert_template(False, False), [row]),
-                (_SET_NODE_CREATED_AT, [{"id": row["id"], "now": row["now"]}]),
-            ]
-        )
+        await self._write_batch([(_node_upsert_template(False, False), [row])])
 
     async def add_nodes(
         self,
@@ -663,7 +672,7 @@ class TypeDBAdapter(GraphDBInterface):
                 row["run"] = str(pipeline_run_id)
             rows[row["id"]] = row
         template = _node_upsert_template(source_ref_key is not None, pipeline_run_id is not None)
-        await self._write_rows(template, list(rows.values()), _SET_NODE_CREATED_AT, "id")
+        await self._write_rows(template, list(rows.values()))
 
     async def extract_node(self, node_id: str):
         return await self.get_node(node_id)
