@@ -22,14 +22,18 @@ per template and are injection-safe by construction.
 
 The TypeDB Python driver is synchronous (the async Rust core stops at the
 FFI boundary), while cognee's ``GraphDBInterface`` is fully async. Driver
-work runs on a small dedicated thread pool, one transaction per adapter
-call. Consequently each adapter method is atomic, but sequences of calls
-(e.g. cognee's add_nodes followed by add_edges) are not — the same property
-every sibling adapter has.
+work runs on a small dedicated thread pool. Batch writes (``add_nodes`` /
+``add_edges``) run as chunked transactions of ``WRITE_CHUNK_ROWS`` rows with
+``WRITE_CONCURRENCY`` in flight, so a batch is not atomic: on failure,
+committed chunks stay committed and pending ones are cancelled — the same
+property the sibling adapters' batches have. Commit isolation conflicts
+(``[STC2]``) are retried on every write path; TypeDB rolls a failed commit
+back entirely, so a retry never duplicates work.
 """
 
 import asyncio
 import json
+import random
 import re
 import threading
 import time
@@ -162,7 +166,8 @@ def _now_ms() -> int:
 
 
 def _edge_key(source_id: str, target_id: str, relationship_name: str) -> str:
-    return f"{source_id}|{target_id}|{relationship_name}"
+    """Edge identity as a JSON-encoded triple, so ids containing '|' cannot collide."""
+    return json.dumps([source_id, target_id, relationship_name], separators=(",", ":"))
 
 
 _FETCH_NODES = """
@@ -192,7 +197,10 @@ delete $n;
 # Incident edges of an anchor node, one query per role the anchor plays (an
 # `or` over the role is 12-18x slower than two directional queries — see
 # benchmarks/README.md). Both produce the same document shape; self-loops
-# appear in both and consumers de-duplicate by (source, target, rel).
+# appear in both and consumers de-duplicate by (source, target, rel). Only
+# the far endpoint's document is fetched — the anchor is always already
+# known to every consumer, and hub nodes would otherwise ship their payload
+# once per incident edge.
 _INCIDENT_EDGES_OUT = """
 given $id: string;
 match
@@ -202,7 +210,7 @@ match
   $e has relationship-name $rel;
 fetch {
   "source": $id, "target": $mid, "relationship_name": $rel,
-  "edge": { $e.* }, "source_node": { $n.* }, "target_node": { $m.* }
+  "edge": { $e.* }, "source_node": { "node-id": $id }, "target_node": { $m.* }
 };
 """
 
@@ -215,7 +223,7 @@ match
   $e has relationship-name $rel;
 fetch {
   "source": $mid, "target": $id, "relationship_name": $rel,
-  "edge": { $e.* }, "source_node": { $m.* }, "target_node": { $n.* }
+  "edge": { $e.* }, "source_node": { $m.* }, "target_node": { "node-id": $id }
 };
 """
 
@@ -304,6 +312,8 @@ class TypeDBAdapter(GraphDBInterface):
         self._driver = None
         self._schema_initialized = False
         self._lock = asyncio.Lock()
+        # Caps in-flight chunk transactions across ALL concurrent batch calls.
+        self._write_semaphore = asyncio.Semaphore(WRITE_CONCURRENCY)
         # Guards driver open/close and executor creation across threads.
         self._state_lock = threading.Lock()
         # Small dedicated pool: makes the concurrency ceiling on the shared
@@ -317,8 +327,10 @@ class TypeDBAdapter(GraphDBInterface):
     def _get_executor(self) -> ThreadPoolExecutor:
         with self._state_lock:
             if self._executor is None:
+                # One thread beyond the write concurrency so a read is never
+                # queued behind a full set of in-flight write chunks.
                 self._executor = ThreadPoolExecutor(
-                    max_workers=4, thread_name_prefix="typedb-adapter"
+                    max_workers=WRITE_CONCURRENCY + 1, thread_name_prefix="typedb-adapter"
                 )
             return self._executor
 
@@ -442,34 +454,37 @@ class TypeDBAdapter(GraphDBInterface):
             self._run_batch_sync, self._as_specs(queries), TransactionType.READ, True
         )
 
-    async def _write_batch(self, queries) -> None:
+    @staticmethod
+    def _is_commit_conflict(error: Exception) -> bool:
+        """TypeDB [STC2]: commit lost an isolation conflict; nothing was committed."""
+        return str(error).lstrip().startswith("[STC2]")
+
+    @staticmethod
+    async def _backoff(attempt: int) -> None:
+        await asyncio.sleep(0.02 * (2**attempt) * (0.5 + random.random()))
+
+    async def _write_batch(self, queries, retry: bool = True) -> None:
         """Run write queries in one WRITE transaction; results are discarded.
 
         Rows are never collected: errors surface via resolve()/commit(), and
         iterating write answers is pure FFI overhead (and forbidden anyway in
-        multi-query batches, see _run_batch_sync).
+        multi-query batches, see _run_batch_sync). Commit isolation conflicts
+        are retried with backoff: a failed commit rolls the whole transaction
+        back, so replaying it can never duplicate work.
         """
         from typedb.driver import TransactionType
 
         await self._ensure_database()
-        await self._run_sync(
-            self._run_batch_sync, self._as_specs(queries), TransactionType.WRITE, False
-        )
-
-    async def _write_batch_with_retry(self, queries) -> None:
-        """_write_batch, retrying TypeDB commit isolation conflicts (STC2).
-
-        Concurrent transactions conflict at commit even on disjoint ids; the
-        upserts are idempotent, so replaying the whole batch is safe.
-        """
-        for attempt in range(COMMIT_RETRIES):
+        specs = self._as_specs(queries)
+        attempts = COMMIT_RETRIES if retry else 1
+        for attempt in range(attempts):
             try:
-                await self._write_batch(queries)
+                await self._run_sync(self._run_batch_sync, specs, TransactionType.WRITE, False)
                 return
             except Exception as error:
-                if "STC2" not in str(error) or attempt + 1 == COMMIT_RETRIES:
+                if attempt + 1 == attempts or not self._is_commit_conflict(error):
                     raise
-                await asyncio.sleep(0.02 * (2**attempt))
+                await self._backoff(attempt)
 
     async def _write_rows(
         self,
@@ -478,29 +493,44 @@ class TypeDBAdapter(GraphDBInterface):
         created_query: str | None = None,
         key: str | None = None,
     ):
-        """Upsert rows in chunked transactions, WRITE_CONCURRENCY at a time.
+        """Upsert rows as chunked transactions, WRITE_CONCURRENCY in flight.
 
         When ``created_query`` is given, each chunk's transaction also runs
-        that set-once created-at statement after the upsert.
+        that set-once created-at statement after the upsert. The batch is not
+        atomic: on the first failure, chunks not yet started are cancelled,
+        chunks already committed stay committed, and chunks mid-transaction
+        run to completion (a driver call on a worker thread cannot be
+        interrupted) before the error propagates.
         """
         if not rows:
             return
         chunks = [rows[i : i + WRITE_CHUNK_ROWS] for i in range(0, len(rows), WRITE_CHUNK_ROWS)]
-        semaphore = asyncio.Semaphore(WRITE_CONCURRENCY)
+        tasks = [
+            asyncio.create_task(self._write_chunk(template, chunk, created_query, key))
+            for chunk in chunks
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
-        async def write(chunk):
-            specs = [(template, chunk)]
-            if created_query is not None:
-                specs.append((created_query, [{key: row[key], "now": row["now"]} for row in chunk]))
-            async with semaphore:
-                await self._write_batch_with_retry(specs)
-
-        await asyncio.gather(*(write(chunk) for chunk in chunks))
-
-    def _query_sync(self, query_text: str, given_rows) -> list[dict[str, Any]]:
-        """Run one raw query in its own transaction, inferring the type."""
-        transaction_type = self._transaction_type_for(query_text)
-        return self._run_batch_sync([(query_text, given_rows)], transaction_type, True)[0]
+    async def _write_chunk(self, template, chunk, created_query, key) -> None:
+        specs = [(template, chunk)]
+        if created_query is not None:
+            specs.append((created_query, [{key: row[key], "now": row["now"]} for row in chunk]))
+        for attempt in range(COMMIT_RETRIES):
+            try:
+                # The slot is held only for the attempt, never during backoff.
+                async with self._write_semaphore:
+                    await self._write_batch(specs, retry=False)
+                return
+            except Exception as error:
+                if attempt + 1 == COMMIT_RETRIES or not self._is_commit_conflict(error):
+                    raise
+                await self._backoff(attempt)
 
     @classmethod
     def _concept_to_value(cls, concept) -> Any:
@@ -573,7 +603,9 @@ class TypeDBAdapter(GraphDBInterface):
             "props": json.dumps(properties, cls=JSONEncoder),
             # Mirrors DataPoint.created_at (epoch ms). Payloads without one
             # (add_node's dict form) get the write time.
-            "created": created if isinstance(created, int) else _now_ms(),
+            "created": (
+                created if isinstance(created, int) and not isinstance(created, bool) else _now_ms()
+            ),
         }
 
     def _node_row(self, node: DataPoint) -> dict[str, Any]:
@@ -621,12 +653,20 @@ class TypeDBAdapter(GraphDBInterface):
 
         await self._ensure_database()
         given_rows = [params] if params else None
-        if transaction_type is not None:
-            explicit = TransactionType[transaction_type.upper()]
-            return (
-                await self._run_sync(self._run_batch_sync, [(query, given_rows)], explicit, True)
-            )[0]
-        return await self._run_sync(self._query_sync, query, given_rows)
+        resolved = (
+            TransactionType[transaction_type.upper()]
+            if transaction_type is not None
+            else self._transaction_type_for(query)
+        )
+        specs = [(query, given_rows)]
+        attempts = 1 if resolved == TransactionType.READ else COMMIT_RETRIES
+        for attempt in range(attempts):
+            try:
+                return (await self._run_sync(self._run_batch_sync, specs, resolved, True))[0]
+            except Exception as error:
+                if attempt + 1 == attempts or not self._is_commit_conflict(error):
+                    raise
+                await self._backoff(attempt)
 
     async def has_node(self, node_id: str) -> bool:
         results = await self._read_batch([(_FETCH_NODES, [{"id": str(node_id)}])])

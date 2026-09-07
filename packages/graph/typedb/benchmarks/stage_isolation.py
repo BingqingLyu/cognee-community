@@ -56,6 +56,7 @@ def node_rows(count, now):
             "type": "Entity",
             "name": f"e{i}",
             "props": props,
+            "created": now,
             "now": now,
         }
         for i in range(count)

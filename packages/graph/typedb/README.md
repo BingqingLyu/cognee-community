@@ -20,6 +20,12 @@ poetry install
 
 ```python
 import asyncio
+import os
+
+# One TypeDB database per dataset for cognee's backend access control (on by
+# default); it must be set before cognee builds its configuration.
+os.environ.setdefault("GRAPH_DATASET_DATABASE_HANDLER", "typedb")
+
 import cognee
 from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee_community_graph_adapter_typedb import register

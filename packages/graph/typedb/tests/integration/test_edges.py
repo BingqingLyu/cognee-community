@@ -45,3 +45,15 @@ async def test_add_edges_skips_missing_endpoints(seeded):
     adapter = seeded.adapter
     await adapter.add_edges([(seeded.ml, "missing-node", "dangling", {})])
     assert await adapter.has_edges([(seeded.ml, "missing-node", "dangling", {})]) == []
+
+
+async def test_edge_identity_survives_separator_characters_in_ids(adapter):
+    for node_id in ("a|b", "c", "a", "b|c"):
+        await adapter.add_node(node_id, {"name": node_id})
+    await adapter.add_edge("a|b", "c", "r")
+    await adapter.add_edge("a", "b|c", "r")
+    assert await adapter.has_edge("a|b", "c", "r")
+    assert await adapter.has_edge("a", "b|c", "r")
+    assert not await adapter.has_edge("a", "c", "r")
+    _, edges = await adapter.get_graph_data()
+    assert len(edges) == 2

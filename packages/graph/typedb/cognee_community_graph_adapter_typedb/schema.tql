@@ -6,7 +6,7 @@ define
   attribute properties-json value string;    # JSON blob of remaining fields
   attribute created-at value integer;        # ms epoch ('long' does not exist in TypeDB 3)
   attribute updated-at value integer;
-  attribute edge-key value string;           # "{source}|{target}|{rel}" MERGE identity
+  attribute edge-key value string;           # JSON [source, target, rel] MERGE identity
   attribute source-ref-key value string;
   attribute source-dataset-id value string;
   attribute source-run-id value string;

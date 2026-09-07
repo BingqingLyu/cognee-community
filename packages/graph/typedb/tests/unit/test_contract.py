@@ -37,20 +37,17 @@ def test_constructor_defaults():
     assert adapter.database_name == "cognee"
 
 
-def test_register_module_import_registers_provider():
-    # Run in a subprocess: importing the side-effect module shadows the
-    # package-level register() function for the rest of the process.
-    import subprocess
-    import sys
+def test_register_module_import_does_not_shadow_the_function():
+    import importlib
 
-    code = (
-        "import cognee_community_graph_adapter_typedb.register\n"
-        "from cognee.infrastructure.databases.graph.supported_databases import "
-        "supported_databases\n"
-        "from cognee_community_graph_adapter_typedb import TypeDBAdapter\n"
-        "assert supported_databases['typedb'] is TypeDBAdapter\n"
-    )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    # `import pkg.register as m` would bind the re-exported *function* (the
+    # package attribute), so fetch the module object itself.
+    register_module = importlib.import_module("cognee_community_graph_adapter_typedb.register")
+    importlib.reload(register_module)  # re-runs the import-time registration
+    assert_registered("typedb", TypeDBAdapter)
+    from cognee_community_graph_adapter_typedb import register as exported
+
+    assert callable(exported)
 
 
 def test_register_adds_typedb_dataset_database_handler():
@@ -83,3 +80,19 @@ def test_dataset_database_name_derivation_and_validation():
     for foreign in ("cognee", "typedb", "cognee_../x", "cognee_" + "a" * 70, ""):
         with pytest.raises(ValueError):
             TypeDBDatasetDatabaseHandler._validate_database_name(foreign)
+
+
+def test_edge_key_is_unambiguous_for_ids_containing_separators():
+    from cognee_community_graph_adapter_typedb.typedb_adapter import _edge_key
+
+    assert _edge_key("a|b", "c", "r") != _edge_key("a", "b|c", "r")
+    assert _edge_key("a", "b", "r") == _edge_key("a", "b", "r")
+
+
+def test_created_at_mirror_rejects_bool_and_non_int_payload_values():
+    from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
+
+    for value in (True, "2026-01-01", None, 1.5):
+        created = TypeDBAdapter._row_from_properties("n", {"created_at": value}, "T")["created"]
+        assert isinstance(created, int) and not isinstance(created, bool)
+    assert TypeDBAdapter._row_from_properties("n", {"created_at": 42}, "T")["created"] == 42

@@ -13,12 +13,10 @@ Select it with ``GRAPH_DATASET_DATABASE_HANDLER=typedb`` (cognee's built-in
 provider→handler derivation only knows in-tree providers).
 """
 
-import os
 import re
 from collections.abc import Mapping
 from uuid import UUID
 
-from cognee.base_config import get_base_config
 from cognee.infrastructure.databases.dataset_database_handler import (
     DatasetDatabaseHandlerInterface,
 )
@@ -97,18 +95,9 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
         username = info.get("graph_database_username") or graph_config.graph_database_username
         password = info.get("graph_database_password") or graph_config.graph_database_password
 
-        graph_engine_cache.evict(
-            graph_database_provider="typedb",
-            graph_file_path=os.path.join(
-                get_base_config().system_root_directory, "databases", database_name
-            ),
-            graph_database_url=url,
-            graph_database_name=database_name,
-            graph_database_username=username,
-            graph_database_password=password,
-            graph_database_key=cls._field(dataset_database, "graph_database_key"),
-            graph_dataset_database_handler=TYPEDB_DATASET_DATABASE_HANDLER,
-        )
+        # Evict by database name: cognee's cache key also carries the user-scoped
+        # graph_file_path and subprocess flag, which a handler cannot rebuild.
+        await graph_engine_cache.aevict_for_database(database_name)
 
         adapter = TypeDBAdapter(
             graph_database_url=url,
