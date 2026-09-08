@@ -4,38 +4,21 @@ Tests are skipped when no server listens on 127.0.0.1:1729 (or GRAPH_DATABASE_UR
 No LLM or embedding secrets are needed.
 """
 
-import os
-import socket
 import uuid
 from types import SimpleNamespace
 
 import pytest
-from cognee.infrastructure.engine import DataPoint
+from support import ADDRESS, Concept, server_available
 
 from cognee_community_graph_adapter_typedb import TypeDBAdapter
 
-ADDRESS = os.environ.get("GRAPH_DATABASE_URL", "127.0.0.1:1729")
-
-
-def _server_available() -> bool:
-    host, _, port = ADDRESS.rpartition(":")
-    try:
-        with socket.create_connection((host or "127.0.0.1", int(port)), timeout=2):
-            return True
-    except OSError:
-        return False
-
-
-class Concept(DataPoint):
-    name: str
-    description: str | None = None
-    metadata: dict = {"index_fields": ["name"]}
+__all__ = ["ADDRESS", "Concept", "server_available"]
 
 
 @pytest.fixture
 async def adapter():
     """A TypeDBAdapter against a fresh, uniquely named database."""
-    if not _server_available():
+    if not server_available():
         pytest.skip(f"no TypeDB server at {ADDRESS}")
     adapter = TypeDBAdapter(
         graph_database_url=ADDRESS,

@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-from conftest import Concept
+from support import Concept
 
 
 async def test_get_graph_data(seeded):

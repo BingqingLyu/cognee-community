@@ -166,8 +166,9 @@ graph visualization) against a local TypeDB server.
 ## Running tests
 
 ```bash
-uv run pytest tests/unit -q     # offline contract tests, no server needed
-uv run pytest tests -q          # + integration tests (needs TypeDB on 127.0.0.1:1729)
+uv run pytest tests/unit -q           # offline contract tests, no server needed
+uv run pytest tests/integration -q    # adapter against TypeDB on 127.0.0.1:1729
+uv run pytest tests/e2e -q            # cognee's shared add->cognify->search suite (+ LLM key)
 ```
 
 ## License

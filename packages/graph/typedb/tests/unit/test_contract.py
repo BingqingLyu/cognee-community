@@ -1,5 +1,6 @@
 """Offline cognee conformance tests. No TypeDB server, no secrets."""
 
+import pytest
 from contract_suite import assert_graph_contract
 from contract_suite.graph_contract import assert_registered
 
@@ -96,3 +97,17 @@ def test_created_at_mirror_rejects_bool_and_non_int_payload_values():
         created = TypeDBAdapter._row_from_properties("n", {"created_at": value}, "T")["created"]
         assert isinstance(created, int) and not isinstance(created, bool)
     assert TypeDBAdapter._row_from_properties("n", {"created_at": 42}, "T")["created"] == 42
+
+
+def test_cypher_and_temporal_search_types_are_gated():
+    """Cognee routes Cypher / temporal searches by these; both must refuse cleanly."""
+    import asyncio
+
+    from cognee.modules.retrieval.exceptions import SearchTypeNotSupported
+
+    assert TypeDBAdapter.supports_cypher_queries is False
+    adapter = TypeDBAdapter()
+    with pytest.raises(SearchTypeNotSupported):
+        asyncio.run(adapter.collect_time_ids(time_from=1, time_to=2))
+    with pytest.raises(SearchTypeNotSupported):
+        asyncio.run(adapter.collect_events(ids=["x"]))

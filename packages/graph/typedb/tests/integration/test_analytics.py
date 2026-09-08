@@ -1,6 +1,7 @@
 """Analytics tier: neighborhood, components, metrics, subgraphs, filters."""
 
-from conftest import Concept
+import pytest
+from support import Concept
 
 
 async def test_get_neighborhood_depth_and_edge_types(seeded):
@@ -95,3 +96,20 @@ async def test_get_model_independent_graph_data(seeded):
     assert len(nodes_result[0]["nodes"]) == 3
     elements = edges_result[0]["elements"]
     assert [seeded.ml, "is_subset_of", seeded.ai] in elements
+
+
+async def test_get_id_filtered_graph_data(seeded):
+    adapter = seeded.adapter
+    nodes, edges = await adapter.get_id_filtered_graph_data([seeded.ml])
+    # ml plus its direct neighbours; only edges touching ml (dl->ai is excluded).
+    assert {node_id for node_id, _ in nodes} == {seeded.ml, seeded.ai, seeded.dl}
+    assert {(source, target) for source, target, _, _ in edges} == {
+        (seeded.ml, seeded.ai),
+        (seeded.dl, seeded.ml),
+    }
+    assert all(props.get("name") for _, props in nodes)
+
+    assert await adapter.get_id_filtered_graph_data([]) == ([], [])
+    assert await adapter.get_id_filtered_graph_data(["no-such-node"]) == ([], [])
+    with pytest.raises(ValueError):
+        await adapter.get_id_filtered_graph_data([123])

@@ -48,6 +48,7 @@ from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
 )
 from cognee.infrastructure.engine import DataPoint
+from cognee.modules.retrieval.exceptions import SearchTypeNotSupported
 from cognee.modules.storage.utils import JSONEncoder
 from cognee.shared.logging_utils import get_logger
 
@@ -1052,6 +1053,40 @@ class TypeDBAdapter(GraphDBInterface):
         ]
         return (nodes, edges)
 
+    async def get_id_filtered_graph_data(self, target_ids: list[str]):
+        """Targets, their direct neighbours, and only the edges touching a target.
+
+        Same shape as get_graph_data(). CogneeGraph prefers this over the
+        whole-graph projection whenever an adapter provides it, which is what
+        keeps GRAPH_COMPLETION search cost proportional to the search rather
+        than to the graph.
+        """
+        if not target_ids:
+            return ([], [])
+        if not all(isinstance(target_id, str) for target_id in target_ids):
+            raise ValueError("target_ids must be a list of strings")
+
+        target_docs = await self._read_batch(
+            [(_FETCH_NODES, [{"id": target_id} for target_id in dict.fromkeys(target_ids)])]
+        )
+        nodes: dict[str, dict] = {
+            doc["node"]["node-id"]: self._document_to_node_dict(doc["node"])
+            for doc in target_docs[0]
+        }
+        if not nodes:
+            return ([], [])
+
+        edge_docs = await self._sweep_incident(nodes)
+        for document in edge_docs:
+            for endpoint, node_doc in (
+                (document["source"], document["source_node"]),
+                (document["target"], document["target_node"]),
+            ):
+                if endpoint not in nodes:
+                    nodes[endpoint] = self._document_to_node_dict(node_doc)
+        # Every swept edge touches a target, and both endpoints are now known.
+        return (list(nodes.items()), self._in_set_edges(edge_docs, set(nodes)))
+
     async def get_nodeset_subgraph(
         self,
         node_type: type[Any],
@@ -1234,6 +1269,20 @@ class TypeDBAdapter(GraphDBInterface):
         except Exception as error:
             logger.error("Failed to get graph metrics: %s", error)
             raise
+
+    # cognee's TEMPORAL search type calls these two non-interface methods on
+    # the graph engine (temporal_retriever.py) and would otherwise die with an
+    # AttributeError; fail the way the CYPHER/NATURAL_LANGUAGE gates do. Real
+    # implementations are planned (Phase 5 in the work plan).
+    async def collect_time_ids(self, time_from=None, time_to=None):
+        raise SearchTypeNotSupported(
+            "Temporal search is not yet supported with the TypeDBAdapter graph backend."
+        )
+
+    async def collect_events(self, ids):
+        raise SearchTypeNotSupported(
+            "Temporal search is not yet supported with the TypeDBAdapter graph backend."
+        )
 
     async def is_empty(self) -> bool:
         results = await self._read_batch(["match $n isa node; limit 1; reduce $count = count;"])

@@ -1,6 +1,6 @@
 """Node CRUD round-trips."""
 
-from conftest import Concept
+from support import Concept
 
 
 async def test_empty_database(adapter):

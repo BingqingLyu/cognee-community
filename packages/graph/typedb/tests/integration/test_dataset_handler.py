@@ -5,7 +5,7 @@ import uuid
 import cognee
 import pytest
 from cognee.modules.users.models import DatasetDatabase
-from conftest import ADDRESS, Concept, _server_available
+from support import ADDRESS, Concept, server_available
 
 from cognee_community_graph_adapter_typedb import (
     TypeDBAdapter,
@@ -13,7 +13,7 @@ from cognee_community_graph_adapter_typedb import (
     register,
 )
 
-pytestmark = pytest.mark.skipif(not _server_available(), reason=f"no TypeDB server at {ADDRESS}")
+pytestmark = pytest.mark.skipif(not server_available(), reason=f"no TypeDB server at {ADDRESS}")
 
 
 @pytest.fixture
