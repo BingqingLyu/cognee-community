@@ -1,12 +1,22 @@
-"""Shared pytest setup: make packages/shared (contract_suite) importable."""
+"""Shared pytest setup: contract_suite + tests/support.py on sys.path, shared fixtures."""
 
-import os
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "shared"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # tests/support.py
 
-# Per-dataset TypeDB databases for cognee's backend-access-control mode; read
-# when cognee builds its graph config, so it must be set before any test does.
-os.environ.setdefault("GRAPH_DATASET_DATABASE_HANDLER", "typedb")
+import pytest
+
+
+@pytest.fixture
+def typedb_config():
+    """Point cognee at the test TypeDB server (provider, credentials, dataset handler)."""
+    import cognee
+    from support import graph_db_config
+
+    from cognee_community_graph_adapter_typedb import register
+
+    register()
+    cognee.config.set_graph_database_provider("typedb")
+    cognee.config.set_graph_db_config(graph_db_config())

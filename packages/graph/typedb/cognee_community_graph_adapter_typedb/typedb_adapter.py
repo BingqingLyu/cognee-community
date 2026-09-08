@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from cognee.exceptions import CogneeValidationError
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
 )
@@ -311,6 +312,11 @@ class TypeDBAdapter(GraphDBInterface):
         self.database_name = database_name or DEFAULT_DATABASE
 
         self._driver = None
+        # _database_exists: a read has seen the database on the server.
+        # _schema_initialized: a write has run the (idempotent) schema define.
+        # Reads never provision — a stale engine handle used after the
+        # database was dropped must see an empty graph, not recreate it.
+        self._database_exists = False
         self._schema_initialized = False
         self._lock = asyncio.Lock()
         # Caps in-flight chunk transactions across ALL concurrent batch calls.
@@ -357,6 +363,7 @@ class TypeDBAdapter(GraphDBInterface):
             if self._driver is not None:
                 self._driver.close()
                 self._driver = None
+                self._database_exists = False
                 self._schema_initialized = False
 
     async def close(self) -> None:
@@ -375,13 +382,13 @@ class TypeDBAdapter(GraphDBInterface):
                 await asyncio.to_thread(executor.shutdown, True)
             await asyncio.to_thread(self._close_sync)
 
-    def _ensure_database_sync(self) -> None:
+    def _provision_database_sync(self) -> None:
         """Create the database if missing and (re)define the cognee schema.
 
-        The define always runs: it is idempotent, and re-running it applies
-        additive schema evolution to pre-existing databases. (A presence
-        check was tried and reverted: substring matching misfired on foreign
-        types and silently froze the schema at its first version.)
+        Write path only. The define always runs: it is idempotent, and
+        re-running it applies additive schema evolution to pre-existing
+        databases. (A presence check was tried and reverted: substring
+        matching misfired on foreign types and froze the schema at v1.)
         """
         from typedb.driver import TransactionType
 
@@ -391,14 +398,26 @@ class TypeDBAdapter(GraphDBInterface):
         with driver.transaction(self.database_name, TransactionType.SCHEMA) as tx:
             tx.query(COGNEE_SCHEMA).resolve()
             tx.commit()
+        self._database_exists = True
         self._schema_initialized = True
 
-    async def _ensure_database(self) -> None:
+    async def _provision_database(self) -> None:
         if self._schema_initialized:
             return
         async with self._lock:
             if not self._schema_initialized:
-                await self._run_sync(self._ensure_database_sync)
+                await self._run_sync(self._provision_database_sync)
+
+    def _database_exists_sync(self) -> bool:
+        exists = self._get_driver().databases.contains(self.database_name)
+        self._database_exists = exists
+        return exists
+
+    async def _database_available(self) -> bool:
+        """Read-path gate: True if the database exists; never creates it."""
+        if self._schema_initialized or self._database_exists:
+            return True
+        return await self._run_sync(self._database_exists_sync)
 
     def _transaction_type_for(self, query_text: str):
         from typedb.driver import TransactionType
@@ -447,10 +466,15 @@ class TypeDBAdapter(GraphDBInterface):
         return [(query, None) if isinstance(query, str) else query for query in queries]
 
     async def _read_batch(self, queries) -> list[list[dict]]:
-        """Run read queries in one READ transaction; returns rows per query."""
+        """Run read queries in one READ transaction; returns rows per query.
+
+        A missing database yields empty results for every query rather than
+        being created (see _database_available).
+        """
         from typedb.driver import TransactionType
 
-        await self._ensure_database()
+        if not await self._database_available():
+            return [[] for _ in queries]
         return await self._run_sync(
             self._run_batch_sync, self._as_specs(queries), TransactionType.READ, True
         )
@@ -475,7 +499,7 @@ class TypeDBAdapter(GraphDBInterface):
         """
         from typedb.driver import TransactionType
 
-        await self._ensure_database()
+        await self._provision_database()
         specs = self._as_specs(queries)
         attempts = COMMIT_RETRIES if retry else 1
         for attempt in range(attempts):
@@ -652,13 +676,17 @@ class TypeDBAdapter(GraphDBInterface):
         """
         from typedb.driver import TransactionType
 
-        await self._ensure_database()
         given_rows = [params] if params else None
         resolved = (
             TransactionType[transaction_type.upper()]
             if transaction_type is not None
             else self._transaction_type_for(query)
         )
+        if resolved == TransactionType.READ:
+            if not await self._database_available():
+                return []
+        else:
+            await self._provision_database()
         specs = [(query, given_rows)]
         attempts = 1 if resolved == TransactionType.READ else COMMIT_RETRIES
         for attempt in range(attempts):
@@ -883,6 +911,40 @@ class TypeDBAdapter(GraphDBInterface):
                     edges[key] = cls._document_to_edge_properties(document["edge"])
         return [(source, target, rel, props) for (source, target, rel), props in edges.items()]
 
+    async def _fetch_with_incident_edges(self, node_ids) -> tuple[list[dict], list[dict]]:
+        """Node documents for ``node_ids`` plus all their incident edge documents,
+        in a single read transaction (fetch + both directional sweeps)."""
+        ids = sorted({str(node_id) for node_id in node_ids})
+        if not ids:
+            return [], []
+        rows = [{"id": node_id} for node_id in ids]
+        node_docs, outgoing, incoming = await self._read_batch(
+            [(_FETCH_NODES, rows), (_INCIDENT_EDGES_OUT, rows), (_INCIDENT_EDGES_IN, rows)]
+        )
+        return node_docs, outgoing + incoming
+
+    @classmethod
+    def _absorb_far_endpoints(
+        cls, edge_docs, nodes: dict[str, dict], wanted_types: set[str] | None = None
+    ) -> set[str]:
+        """Add the not-yet-known endpoints of ``edge_docs`` to ``nodes``.
+
+        Returns the ids added (the next BFS frontier). Edges outside
+        ``wanted_types`` are not followed.
+        """
+        added: set[str] = set()
+        for document in edge_docs:
+            if wanted_types is not None and document["relationship_name"] not in wanted_types:
+                continue
+            for endpoint, node_doc in (
+                (document["source"], document["source_node"]),
+                (document["target"], document["target_node"]),
+            ):
+                if endpoint not in nodes:
+                    nodes[endpoint] = cls._document_to_node_dict(node_doc)
+                    added.add(endpoint)
+        return added
+
     async def get_neighborhood(
         self,
         node_ids: list[str],
@@ -900,34 +962,21 @@ class TypeDBAdapter(GraphDBInterface):
             return ([], [])
         wanted_types = set(edge_types) if edge_types else None
 
-        seed_docs = await self._read_batch(
-            [(_FETCH_NODES, [{"id": str(node_id)} for node_id in dict.fromkeys(node_ids)])]
-        )
+        node_docs, edge_docs = await self._fetch_with_incident_edges(node_ids)
         nodes: dict[str, dict] = {
-            doc["node"]["node-id"]: self._document_to_node_dict(doc["node"]) for doc in seed_docs[0]
+            doc["node"]["node-id"]: self._document_to_node_dict(doc["node"]) for doc in node_docs
         }
-
-        edge_docs: list[dict[str, Any]] = []
-        swept: set[str] = set()
-        frontier = set(nodes)
-        for _ in range(max(depth, 0)):
+        swept = set(nodes)
+        frontier = (
+            self._absorb_far_endpoints(edge_docs, nodes, wanted_types) if depth > 0 else set()
+        )
+        for _ in range(1, max(depth, 0)):
             if not frontier:
                 break
             documents = await self._sweep_incident(frontier)
             swept |= frontier
             edge_docs.extend(documents)
-            next_frontier: set[str] = set()
-            for document in documents:
-                if wanted_types is not None and document["relationship_name"] not in wanted_types:
-                    continue
-                for endpoint, node_doc in (
-                    (document["source"], document["source_node"]),
-                    (document["target"], document["target_node"]),
-                ):
-                    if endpoint not in nodes:
-                        nodes[endpoint] = self._document_to_node_dict(node_doc)
-                        next_frontier.add(endpoint)
-            frontier = next_frontier
+            frontier = self._absorb_far_endpoints(documents, nodes, wanted_types)
 
         # Edges between nodes of the final frontier were never swept.
         edge_docs.extend(await self._sweep_incident(set(nodes) - swept))
@@ -1059,31 +1108,20 @@ class TypeDBAdapter(GraphDBInterface):
         Same shape as get_graph_data(). CogneeGraph prefers this over the
         whole-graph projection whenever an adapter provides it, which is what
         keeps GRAPH_COMPLETION search cost proportional to the search rather
-        than to the graph.
+        than to the graph. One read transaction.
         """
         if not target_ids:
             return ([], [])
         if not all(isinstance(target_id, str) for target_id in target_ids):
-            raise ValueError("target_ids must be a list of strings")
+            raise CogneeValidationError("target_ids must be a list of strings")
 
-        target_docs = await self._read_batch(
-            [(_FETCH_NODES, [{"id": target_id} for target_id in dict.fromkeys(target_ids)])]
-        )
+        node_docs, edge_docs = await self._fetch_with_incident_edges(target_ids)
         nodes: dict[str, dict] = {
-            doc["node"]["node-id"]: self._document_to_node_dict(doc["node"])
-            for doc in target_docs[0]
+            doc["node"]["node-id"]: self._document_to_node_dict(doc["node"]) for doc in node_docs
         }
         if not nodes:
             return ([], [])
-
-        edge_docs = await self._sweep_incident(nodes)
-        for document in edge_docs:
-            for endpoint, node_doc in (
-                (document["source"], document["source_node"]),
-                (document["target"], document["target_node"]),
-            ):
-                if endpoint not in nodes:
-                    nodes[endpoint] = self._document_to_node_dict(node_doc)
+        self._absorb_far_endpoints(edge_docs, nodes)
         # Every swept edge touches a target, and both endpoints are now known.
         return (list(nodes.items()), self._in_set_edges(edge_docs, set(nodes)))
 
@@ -1286,4 +1324,6 @@ class TypeDBAdapter(GraphDBInterface):
 
     async def is_empty(self) -> bool:
         results = await self._read_batch(["match $n isa node; limit 1; reduce $count = count;"])
-        return bool(results[0] and results[0][0].get("count", 1) == 0)
+        if not results[0]:
+            return True  # no database (or no rows): nothing to search
+        return results[0][0].get("count", 1) == 0

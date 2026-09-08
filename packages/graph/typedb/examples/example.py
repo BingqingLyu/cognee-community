@@ -29,6 +29,8 @@ async def main():
             "graph_database_url": os.environ.get("GRAPH_DATABASE_URL", "127.0.0.1:1729"),
             "graph_database_username": os.environ.get("GRAPH_DATABASE_USERNAME", "admin"),
             "graph_database_password": os.environ.get("GRAPH_DATABASE_PASSWORD", "password"),
+            # One TypeDB database per dataset (cognee's backend access control).
+            "graph_dataset_database_handler": "typedb",
         }
     )
 

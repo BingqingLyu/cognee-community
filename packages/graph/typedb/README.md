@@ -20,11 +20,6 @@ poetry install
 
 ```python
 import asyncio
-import os
-
-# One TypeDB database per dataset for cognee's backend access control (on by
-# default); it must be set before cognee builds its configuration.
-os.environ.setdefault("GRAPH_DATASET_DATABASE_HANDLER", "typedb")
 
 import cognee
 from cognee.infrastructure.databases.graph import get_graph_engine
@@ -44,6 +39,9 @@ async def main():
             "graph_database_url": "127.0.0.1:1729",
             "graph_database_username": "admin",
             "graph_database_password": "password",
+            # One TypeDB database per dataset for cognee's backend access
+            # control (on by default). Equivalent env var below.
+            "graph_dataset_database_handler": "typedb",
         }
     )
 
@@ -79,7 +77,8 @@ Configure via `set_graph_db_config()`:
 | `graph_database_port` | – | Appended to `graph_database_url` when the address carries no port |
 | `graph_database_username` | `admin` | TypeDB user |
 | `graph_database_password` | `password` | TypeDB password |
-| `graph_database_name` | `cognee` | TypeDB database; created (with the cognee schema) on first use |
+| `graph_database_name` | `cognee` | TypeDB database; created (with the cognee schema) on first write |
+| `graph_dataset_database_handler` | – | Set to `typedb` for one database per dataset (backend access control) |
 
 ### Environment Variables
 
@@ -98,7 +97,8 @@ Cognee's backend access control (on by default in cognee 1.x) maps each
 dataset to its own graph database through a dataset database handler. This
 package registers one for TypeDB — one TypeDB database per dataset, named
 `cognee_<dataset uuid>` — under the handler key `typedb`. Select it alongside
-the provider:
+the provider, either in `set_graph_db_config()` (as in the Usage example) or
+via the environment:
 
 ```bash
 export GRAPH_DATABASE_PROVIDER="typedb"
@@ -153,6 +153,10 @@ a fresh database.
   `SearchType.NATURAL_LANGUAGE`) are cleanly unsupported
   (`supports_cypher_queries = False`); a TypeQL natural-language retriever is
   planned.
+- `SearchType.TEMPORAL` is not supported yet: queries containing a time range
+  raise `SearchTypeNotSupported` (after cognee's date-extraction LLM call;
+  cognee has no entry gate for this search type), while queries without one
+  fall back to cognee's triplet search. Timestamp/Event retrieval is planned.
 - Like most sibling adapters, the optional legacy-deletion methods
   `get_document_subgraph` / `get_degree_one_nodes` are not implemented; that
   path is only reachable for data ingested before cognee 1.4.x's relational
@@ -168,7 +172,7 @@ graph visualization) against a local TypeDB server.
 ```bash
 uv run pytest tests/unit -q           # offline contract tests, no server needed
 uv run pytest tests/integration -q    # adapter against TypeDB on 127.0.0.1:1729
-uv run pytest tests/e2e -q            # cognee's shared add->cognify->search suite (+ LLM key)
+RUN_E2E_TESTS=1 uv run pytest tests/e2e -q   # cognee's shared suite, both access-control modes (+ LLM key)
 ```
 
 ## License

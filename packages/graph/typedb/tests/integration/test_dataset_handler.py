@@ -5,28 +5,11 @@ import uuid
 import cognee
 import pytest
 from cognee.modules.users.models import DatasetDatabase
-from support import ADDRESS, Concept, server_available
+from support import ADDRESS, Concept, database_exists, server_available
 
-from cognee_community_graph_adapter_typedb import (
-    TypeDBAdapter,
-    TypeDBDatasetDatabaseHandler,
-    register,
-)
+from cognee_community_graph_adapter_typedb import TypeDBAdapter, TypeDBDatasetDatabaseHandler
 
 pytestmark = pytest.mark.skipif(not server_available(), reason=f"no TypeDB server at {ADDRESS}")
-
-
-@pytest.fixture
-def typedb_config():
-    register()
-    cognee.config.set_graph_database_provider("typedb")
-    cognee.config.set_graph_db_config(
-        {
-            "graph_database_url": ADDRESS,
-            "graph_database_username": "admin",
-            "graph_database_password": "password",
-        }
-    )
 
 
 def _row(info: dict) -> DatasetDatabase:
@@ -60,11 +43,7 @@ async def test_create_and_delete_dataset_database(typedb_config):
     assert resolved.graph_database_connection_info["graph_database_password"] == "password"
 
     await TypeDBDatasetDatabaseHandler.delete_dataset(_row(info))
-    driver = TypeDBAdapter(graph_database_url=ADDRESS)._get_driver()
-    try:
-        assert not driver.databases.contains(info["graph_database_name"])
-    finally:
-        driver.close()
+    assert not await database_exists(info["graph_database_name"])
 
 
 async def test_datasets_are_isolated(typedb_config):
@@ -107,8 +86,30 @@ async def test_delete_accepts_prune_style_row_mapping(typedb_config):
 
     info = await TypeDBDatasetDatabaseHandler.create_dataset(uuid.uuid4(), None)
     await TypeDBDatasetDatabaseHandler.delete_dataset(MappingProxyType(info))
-    driver = TypeDBAdapter(graph_database_url=ADDRESS)._get_driver()
+    assert not await database_exists(info["graph_database_name"])
+
+
+async def test_reads_never_recreate_a_dropped_dataset_database(typedb_config):
+    """A stale engine handle used after prune/delete must see an empty graph,
+    not re-provision the dropped database (that was leaking one orphan per prune)."""
+    from support import drop_database
+
+    info = await TypeDBDatasetDatabaseHandler.create_dataset(uuid.uuid4(), None)
+    name = info["graph_database_name"]
+    adapter = TypeDBAdapter(graph_database_url=ADDRESS, database_name=name)
     try:
-        assert not driver.databases.contains(info["graph_database_name"])
+        await adapter.add_nodes([Concept(name="before the drop")])
+        await adapter.close()  # what cognee's cache eviction does to the handle
+        await drop_database(name)
+
+        assert await adapter.is_empty()
+        assert await adapter.get_graph_data() == ([], [])
+        assert await adapter.get_node("anything") is None
+        assert await adapter.query("match $n isa node; reduce $c = count;") == []
+        assert not await database_exists(name)  # reads did not recreate it
+
+        await adapter.add_nodes([Concept(name="after the drop")])  # writes do provision
+        assert await database_exists(name)
     finally:
-        driver.close()
+        await adapter.close()
+        await drop_database(name)

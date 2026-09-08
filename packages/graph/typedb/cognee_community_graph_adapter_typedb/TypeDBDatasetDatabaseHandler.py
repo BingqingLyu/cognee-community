@@ -12,12 +12,10 @@ live graph config right before a connection is opened.
 Select it with ``GRAPH_DATASET_DATABASE_HANDLER=typedb`` (cognee's built-in
 provider→handler derivation only knows in-tree providers).
 
-Known behaviour: the adapter provisions its database on first use, so an
-engine handle obtained before ``prune_system`` / dataset deletion and used
-afterwards recreates the dataset's database empty (cognee's shared e2e suite
-does exactly this with its post-prune ``is_empty()`` check). This mirrors the
-Ladybug handler's file-recreation semantics; such databases hold no data and
-no registry row, and are dropped by the next prune only if re-registered.
+Only writes provision a database. Reads on a missing database see an empty
+graph, so an engine handle that outlives ``prune_system`` / dataset deletion
+does not recreate the dropped database (cognee's shared e2e suite calls
+``is_empty()`` on such a handle after its final prune).
 """
 
 import re
@@ -58,7 +56,7 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
         # mid-cognify).
         adapter = cls._adapter(graph_config, database_name)
         try:
-            await adapter._ensure_database()
+            await adapter._provision_database()
         finally:
             await adapter.close()
 

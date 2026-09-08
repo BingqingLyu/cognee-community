@@ -111,5 +111,7 @@ async def test_get_id_filtered_graph_data(seeded):
 
     assert await adapter.get_id_filtered_graph_data([]) == ([], [])
     assert await adapter.get_id_filtered_graph_data(["no-such-node"]) == ([], [])
-    with pytest.raises(ValueError):
+    from cognee.exceptions import CogneeValidationError
+
+    with pytest.raises(CogneeValidationError):
         await adapter.get_id_filtered_graph_data([123])

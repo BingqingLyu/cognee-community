@@ -88,6 +88,7 @@ jobs:
   test-typedb-e2e:
     name: "TypeDB Community Adapter E2E Test"
     runs-on: ubuntu-22.04
+    needs: test-typedb
     services:
       typedb:
         image: typedb/typedb:3.12.3
@@ -117,8 +118,19 @@ jobs:
           echo "TypeDB did not become ready" >&2
           exit 1
 
+      - name: Require LLM secrets
+        # The e2e tests skip without a key; a skipped tier must not read as green.
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "::error::LLM_API_KEY secret is not available; the e2e tier cannot run" >&2
+            exit 1
+          fi
+
       - name: Run TypeDB E2E Tests
         env:
+          RUN_E2E_TESTS: '1'
           ENV: 'dev'
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
           LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}

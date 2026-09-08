@@ -1,4 +1,4 @@
-"""Offline tests of the batch write path (no server: the batch executor is faked)."""
+"""Offline tests of the batch write/read paths (no server: the executor is faked)."""
 
 import asyncio
 
@@ -102,3 +102,22 @@ async def test_write_rows_retries_a_conflicting_chunk_without_holding_a_slot():
     await adapter._write_rows("template", rows)
     assert attempts["0"] == 3
     assert attempts[str(WRITE_CHUNK_ROWS)] == 1
+
+
+async def test_reads_short_circuit_when_the_database_is_missing():
+    """Reads must not provision: a missing database yields empty results."""
+    adapter = TypeDBAdapter()
+    calls = []
+
+    async def fake_run_sync(fn, *args):
+        calls.append(getattr(fn, "__name__", repr(fn)))
+        if fn.__name__ == "_database_exists_sync":
+            return False
+        raise AssertionError("no transaction should run against a missing database")
+
+    adapter._run_sync = fake_run_sync
+    assert await adapter.is_empty() is True
+    assert await adapter.has_node("x") is False
+    assert await adapter.get_graph_data() == ([], [])
+    assert await adapter.query("match $n isa node; reduce $c = count;") == []
+    assert set(calls) == {"_database_exists_sync"}
