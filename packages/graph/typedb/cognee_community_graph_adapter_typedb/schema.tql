@@ -10,13 +10,17 @@ define
   attribute source-ref-key value string;
   attribute source-dataset-id value string;
   attribute source-run-id value string;
+  attribute source-run-ref value string;     # "{SOURCE_RUN_REF_PREFIX}:{run}:{ref}" rollback index
+  attribute provenance-json value string;    # ordered {"keys": [...], "run_refs": [...]} (canonical)
+  attribute edge-object-id value string;     # cognee's deterministic feedback id for an edge
   attribute metadata-key value string;  attribute metadata-value value string;
 
   entity node,
     owns node-id @key, owns name, owns node-type,
     owns properties-json, owns created-at, owns updated-at,
     owns source-ref-key @card(0..), owns source-dataset-id @card(0..),
-    owns source-run-id @card(0..),
+    owns source-run-id @card(0..), owns source-run-ref @card(0..),
+    owns provenance-json,
     plays edge:source, plays edge:target;
 
   relation edge,
@@ -24,6 +28,7 @@ define
     owns edge-key @key, owns relationship-name,
     owns properties-json, owns created-at, owns updated-at,
     owns source-ref-key @card(0..), owns source-dataset-id @card(0..),
-    owns source-run-id @card(0..);
+    owns source-run-id @card(0..), owns source-run-ref @card(0..),
+    owns provenance-json, owns edge-object-id;
 
   entity graph-metadata, owns metadata-key @key, owns metadata-value;

@@ -38,7 +38,6 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from functools import cache
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -48,7 +47,23 @@ from cognee.exceptions import CogneeValidationError
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
 )
+from cognee.infrastructure.databases.provenance import (
+    EdgeDeleteData,
+    EdgeIdentity,
+    NodeDeleteData,
+    get_dataset_id_from_source_ref_key,
+    get_pipeline_run_id_from_source_run_ref,
+    get_source_ref_key_from_source_run_ref,
+)
+from cognee.infrastructure.databases.provenance.source_ref_state import (
+    ProvenanceColumns,
+    derive_dataset_ids,
+    derive_run_ids,
+    provenance_after_attach,
+    provenance_after_remove,
+)
 from cognee.infrastructure.engine import DataPoint
+from cognee.modules.engine.utils import generate_edge_object_id
 from cognee.modules.retrieval.exceptions import SearchTypeNotSupported
 from cognee.modules.storage.utils import JSONEncoder
 from cognee.shared.logging_utils import get_logger
@@ -77,85 +92,32 @@ _COMMENT_RE = re.compile(r"#[^\n]*")
 # --- given-parameterized query templates -----------------------------------
 
 
-def _provenance_stages(var: str, with_ref: bool, with_run: bool) -> tuple[list[str], list[str]]:
-    """Extra given declarations and insert statements for provenance stamps.
+_NODE_UPSERT = """
+given $id: string, $type: string, $name: string, $props: string, $created: integer, $now: integer;
+put $n isa node, has node-id == $id;
+update
+  $n has node-type == $type;
+  $n has name == $name;
+  $n has properties-json == $props;
+  $n has created-at == $created;
+  $n has updated-at == $now;
+"""
 
-    The stamps are @card(0..) so they are inserted (accumulated), not updated.
-    """
-    given, inserts = [], []
-    if with_ref:
-        given.append("$ref: string")
-        inserts.append(f"  {var} has source-ref-key == $ref;")
-    if with_run:
-        given.append("$run: string")
-        inserts.append(f"  {var} has source-run-id == $run;")
-    return given, inserts
+_EDGE_UPSERT = """
+given $key: string, $sid: string, $tid: string, $rel: string, $eoid: string, $props: string,
+  $now: integer;
+match
+  $sa isa node-id == $sid; $s isa node, has $sa;
+  $ta isa node-id == $tid; $t isa node, has $ta;
+put
+  $e isa edge, links (source: $s, target: $t),
+    has edge-key == $key, has relationship-name == $rel;
+update
+  $e has edge-object-id == $eoid;
+  $e has properties-json == $props;
+  $e has updated-at == $now;
+"""
 
-
-@cache
-def _node_upsert_template(with_ref: bool, with_run: bool) -> str:
-    """Node upsert pipeline: put identity, replace mirrors (incl. created-at), stamp."""
-    given = [
-        "$id: string",
-        "$type: string",
-        "$name: string",
-        "$props: string",
-        "$created: integer",
-        "$now: integer",
-    ]
-    extra_given, inserts = _provenance_stages("$n", with_ref, with_run)
-    given += extra_given
-    stages = [
-        "given " + ", ".join(given) + ";",
-        "put $n isa node, has node-id == $id;",
-        "update",
-        "  $n has node-type == $type;",
-        "  $n has name == $name;",
-        "  $n has properties-json == $props;",
-        "  $n has created-at == $created;",
-        "  $n has updated-at == $now;",
-    ]
-    if inserts:
-        stages += ["insert", *inserts]
-    return "\n".join(stages)
-
-
-@cache
-def _edge_upsert_template(with_ref: bool, with_run: bool) -> str:
-    """Edge upsert pipeline keyed on edge-key; endpoints must already exist."""
-    given = [
-        "$key: string",
-        "$sid: string",
-        "$tid: string",
-        "$rel: string",
-        "$props: string",
-        "$now: integer",
-    ]
-    extra_given, inserts = _provenance_stages("$e", with_ref, with_run)
-    given += extra_given
-    stages = [
-        "given " + ", ".join(given) + ";",
-        "match",
-        "  $sa isa node-id == $sid; $s isa node, has $sa;",
-        "  $ta isa node-id == $tid; $t isa node, has $ta;",
-        "put",
-        "  $e isa edge, links (source: $s, target: $t),",
-        "    has edge-key == $key, has relationship-name == $rel;",
-        "update",
-        "  $e has properties-json == $props;",
-        "  $e has updated-at == $now;",
-    ]
-    if inserts:
-        stages += ["insert", *inserts]
-    return "\n".join(stages)
-
-
-# Edge created-at is set once via a separate statement (run after the upsert
-# in the same transaction) rather than as trailing pipeline stages: a
-# negation-only `match not {...}` stage after `update` did not filter rows
-# that already carried created-at, re-stamping them on every write. Nodes
-# need no such statement: their created-at mirrors the DataPoint payload's
-# own created_at (see _row_from_properties).
 _SET_EDGE_CREATED_AT = """
 given $key: string, $now: integer;
 match $k isa edge-key == $key; $e isa edge, has $k; not { $e has created-at $c; };
@@ -278,6 +240,118 @@ WRITE_CHUNK_ROWS = 200
 WRITE_CONCURRENCY = 4
 COMMIT_RETRIES = 6
 
+# --- provenance, weights, metadata, triplets -------------------------------
+
+# Artifact match fragments: bind $x (node or edge) from a given $id.
+_MATCH_BY_ID = {
+    "node": "$a isa node-id == $id; $x isa node, has $a;",
+    "edge": "$k isa edge-key == $id; $x isa edge, has $k;",
+}
+# ProvenanceColumns field -> indexed set attribute.
+_PROVENANCE_ATTRS = {
+    "source_ref_keys": "source-ref-key",
+    "source_dataset_ids": "source-dataset-id",
+    "source_run_ids": "source-run-id",
+    "source_run_refs": "source-run-ref",
+}
+
+
+def _provenance_read_query(kind: str) -> str:
+    return (
+        "given $id: string;\n"
+        f"match {_MATCH_BY_ID[kind]}\n"
+        'fetch { "id": $id, "pj": $x.provenance-json,'
+        ' "keys": [ $x.source-ref-key ], "datasets": [ $x.source-dataset-id ],'
+        ' "runs": [ $x.source-run-id ], "runrefs": [ $x.source-run-ref ] };'
+    )
+
+
+def _attr_insert_query(kind: str, attribute: str) -> str:
+    match = _MATCH_BY_ID[kind]
+    return f"given $id: string, $v: string;\nmatch {match}\ninsert $x has {attribute} == $v;"
+
+
+def _attr_delete_query(kind: str, attribute: str) -> str:
+    return (
+        "given $id: string, $v: string;\n"
+        f"match {_MATCH_BY_ID[kind]} $at isa {attribute} == $v; $x has $at;\n"
+        "delete has $at of $x;"
+    )
+
+
+def _attr_update_query(kind: str, attribute: str) -> str:
+    match = _MATCH_BY_ID[kind]
+    return f"given $id: string, $v: string;\nmatch {match}\nupdate $x has {attribute} == $v;"
+
+
+def _properties_read_query(kind: str, all_artifacts: bool) -> str:
+    if all_artifacts:
+        key_attr = "node-id" if kind == "node" else "edge-key"
+        artifact = "node" if kind == "node" else "edge"
+        return (
+            f"match $x isa {artifact}, has {key_attr} $id, has properties-json $p;\n"
+            'fetch { "id": $id, "p": $p };'
+        )
+    return (
+        "given $id: string;\n"
+        f"match {_MATCH_BY_ID[kind]} $x has properties-json $p;\n"
+        'fetch { "id": $id, "p": $p };'
+    )
+
+
+_NODE_DELETE_DATA = """
+given $id: string;
+match $a isa node-id == $id; $n isa node, has $a;
+fetch { "node": { $n.* }, "pj": $n.provenance-json };
+"""
+_EDGE_DELETE_DATA = """
+given $id: string;
+match
+  $k isa edge-key == $id; $e isa edge, has $k, links (source: $s, target: $t);
+  $s has node-id $sid; $t has node-id $tid; $e has relationship-name $rel;
+fetch { "source": $sid, "target": $tid, "relationship_name": $rel, "edge": { $e.* },
+        "pj": $e.provenance-json };
+"""
+_DELETE_EDGES_BY_KEY = """
+given $id: string;
+match $k isa edge-key == $id; $e isa edge, has $k;
+delete $e;
+"""
+_NODES_BY_ATTR = """
+given $v: string;
+match $n isa node, has {attribute} == $v, has node-id $id;
+fetch {{ "id": $id, "pj": $n.provenance-json }};
+"""
+_EDGES_BY_ATTR = """
+given $v: string;
+match
+  $e isa edge, has {attribute} == $v, links (source: $s, target: $t);
+  $s has node-id $sid; $t has node-id $tid; $e has relationship-name $rel;
+fetch {{ "source": $sid, "target": $tid, "relationship_name": $rel, "pj": $e.provenance-json }};
+"""
+_EDGES_BY_OBJECT_ID = """
+given $v: string;
+match $e isa edge, has edge-object-id == $v, has edge-key $k, has properties-json $p;
+fetch { "eoid": $v, "key": $k, "p": $p };
+"""
+_METADATA_SET = """
+given $k: string, $v: string;
+put $m isa graph-metadata, has metadata-key == $k;
+update $m has metadata-value == $v;
+"""
+_METADATA_GET = """
+match $m isa graph-metadata, has metadata-key $k, has metadata-value $v;
+fetch { "k": $k, "v": $v };
+"""
+_TRIPLETS_BATCH = """
+match
+  $e isa edge, links (source: $s, target: $t), has edge-key $k;
+sort $k;
+offset {offset};
+limit {limit};
+fetch {{ "start": {{ $s.* }}, "edge": {{ $e.* }}, "end": {{ $t.* }} }};
+"""
+
 # Filterable attributes promoted out of properties-json, usable server-side.
 _PROMOTED_FILTER_ATTRS = {"type": "node-type", "name": "name"}
 
@@ -321,6 +395,8 @@ class TypeDBAdapter(GraphDBInterface):
         self._lock = asyncio.Lock()
         # Caps in-flight chunk transactions across ALL concurrent batch calls.
         self._write_semaphore = asyncio.Semaphore(WRITE_CONCURRENCY)
+        # Serializes explicit provenance attach/remove within this adapter.
+        self._provenance_lock = asyncio.Lock()
         # Guards driver open/close and executor creation across threads.
         self._state_lock = threading.Lock()
         # Small dedicated pool: makes the concurrency ceiling on the shared
@@ -517,21 +593,36 @@ class TypeDBAdapter(GraphDBInterface):
         rows: list[dict],
         created_query: str | None = None,
         key: str | None = None,
+        provenance=None,
     ):
         """Upsert rows as chunked transactions, WRITE_CONCURRENCY in flight.
 
-        When ``created_query`` is given, each chunk's transaction also runs
-        that set-once created-at statement after the upsert. The batch is not
-        atomic: on the first failure, chunks not yet started are cancelled,
-        chunks already committed stay committed, and chunks mid-transaction
-        run to completion (a driver call on a worker thread cannot be
-        interrupted) before the error propagates.
+        ``created_query`` (with ``key``) adds the set-once created-at statement
+        to each chunk's transaction. ``provenance`` = (kind, id_field,
+        transition) folds a provenance change into the same transaction, read
+        after the upsert and applied through the cognee transition function.
+        The batch is not atomic: on the first failure, chunks not yet started
+        are cancelled, chunks already committed stay committed, and chunks
+        mid-transaction run to completion before the error propagates.
         """
         if not rows:
             return
         chunks = [rows[i : i + WRITE_CHUNK_ROWS] for i in range(0, len(rows), WRITE_CHUNK_ROWS)]
+
+        def specs_for(chunk):
+            specs = [(template, chunk)]
+            if created_query is not None:
+                specs.append((created_query, [{key: row[key], "now": row["now"]} for row in chunk]))
+            return specs
+
+        def provenance_for(chunk):
+            if provenance is None:
+                return None
+            kind, id_field, transition = provenance
+            return (kind, [row[id_field] for row in chunk], transition)
+
         tasks = [
-            asyncio.create_task(self._write_chunk(template, chunk, created_query, key))
+            asyncio.create_task(self._write_chunk(specs_for(chunk), provenance_for(chunk)))
             for chunk in chunks
         ]
         try:
@@ -542,20 +633,153 @@ class TypeDBAdapter(GraphDBInterface):
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-    async def _write_chunk(self, template, chunk, created_query, key) -> None:
-        specs = [(template, chunk)]
-        if created_query is not None:
-            specs.append((created_query, [{key: row[key], "now": row["now"]} for row in chunk]))
+    async def _write_chunk(self, specs, provenance=None) -> None:
         for attempt in range(COMMIT_RETRIES):
             try:
                 # The slot is held only for the attempt, never during backoff.
                 async with self._write_semaphore:
-                    await self._write_batch(specs, retry=False)
+                    if provenance is None:
+                        await self._write_batch(specs, retry=False)
+                    else:
+                        await self._provision_database()
+                        kind, identities, transition = provenance
+                        await self._run_sync(
+                            self._provenance_change_sync, kind, identities, transition, specs
+                        )
                 return
             except Exception as error:
                 if attempt + 1 == COMMIT_RETRIES or not self._is_commit_conflict(error):
                     raise
                 await self._backoff(attempt)
+
+    # ------------------------------------------------------------------
+    # Read-modify-write primitives (one transaction each, retried on STC2)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decode_provenance(document: dict) -> tuple[list[str], list[str], ProvenanceColumns]:
+        """(ordered keys, ordered run refs, currently stored set columns)."""
+        keys, run_refs = [], []
+        raw = document.get("pj")
+        if raw:
+            try:
+                payload = json.loads(raw)
+                keys = list(payload.get("keys") or [])
+                run_refs = list(payload.get("run_refs") or [])
+            except (TypeError, ValueError):
+                logger.warning("Undecodable provenance-json on %s", document.get("id"))
+        stored = ProvenanceColumns(
+            list(document.get("keys") or []),
+            list(document.get("datasets") or []),
+            list(document.get("runs") or []),
+            list(document.get("runrefs") or []),
+        )
+        # The ordered JSON is canonical; fall back to the set index if absent.
+        return keys or stored.source_ref_keys, run_refs or stored.source_run_refs, stored
+
+    def _provenance_change_sync(self, kind: str, identities: list[str], transition, pre_specs=()):
+        """In one WRITE transaction: run ``pre_specs``, read each artifact's
+        provenance, apply the pure ``transition``, write the diffs, commit.
+
+        The read happens after the pre-specs (so a folded write sees the
+        artifact it just upserted) and its stream is drained before any
+        further write is issued (TSV13).
+        """
+        from typedb.driver import TransactionType
+
+        driver = self._get_driver()
+        with driver.transaction(self.database_name, TransactionType.WRITE) as tx:
+            for query_text, given_rows in pre_specs:
+                tx.query(query_text, given_rows=given_rows).resolve()
+            rows = [{"id": identity} for identity in dict.fromkeys(identities)]
+            documents = self._collect_answer(
+                tx.query(_provenance_read_query(kind), given_rows=rows).resolve()
+            )
+            inserts: dict[str, list[dict]] = {}
+            deletes: dict[str, list[dict]] = {}
+            json_rows: list[dict] = []
+            for document in documents:
+                identity = document["id"]
+                keys, run_refs, stored = self._decode_provenance(document)
+                columns = transition(keys, run_refs)
+                for field, attribute in _PROVENANCE_ATTRS.items():
+                    old, new = set(getattr(stored, field)), set(getattr(columns, field))
+                    for value in sorted(new - old):
+                        inserts.setdefault(attribute, []).append({"id": identity, "v": value})
+                    for value in sorted(old - new):
+                        deletes.setdefault(attribute, []).append({"id": identity, "v": value})
+                encoded = json.dumps(
+                    {"keys": columns.source_ref_keys, "run_refs": columns.source_run_refs}
+                )
+                if encoded != (document.get("pj") or ""):
+                    json_rows.append({"id": identity, "v": encoded})
+            for attribute, attr_rows in deletes.items():
+                tx.query(_attr_delete_query(kind, attribute), given_rows=attr_rows).resolve()
+            for attribute, attr_rows in inserts.items():
+                tx.query(_attr_insert_query(kind, attribute), given_rows=attr_rows).resolve()
+            if json_rows:
+                tx.query(
+                    _attr_update_query(kind, "provenance-json"), given_rows=json_rows
+                ).resolve()
+            tx.commit()
+
+    async def _provenance_change(self, kind: str, identities, transition) -> None:
+        identities = [str(identity) for identity in identities]
+        if not identities:
+            return
+        await self._provision_database()
+        async with self._provenance_lock:
+            for attempt in range(COMMIT_RETRIES):
+                try:
+                    await self._run_sync(
+                        self._provenance_change_sync, kind, identities, transition, []
+                    )
+                    return
+                except Exception as error:
+                    if attempt + 1 == COMMIT_RETRIES or not self._is_commit_conflict(error):
+                        raise
+                    await self._backoff(attempt)
+
+    def _mutate_properties_sync(self, kind: str, identities, mutate) -> set[str]:
+        """In one WRITE transaction: read properties-json for ``identities``
+        (all artifacts when None), apply ``mutate(identity, props) -> props |
+        None``, write back the changed payloads, commit. Returns updated ids."""
+        from typedb.driver import TransactionType
+
+        driver = self._get_driver()
+        with driver.transaction(self.database_name, TransactionType.WRITE) as tx:
+            if identities is None:
+                answer = tx.query(_properties_read_query(kind, True)).resolve()
+            else:
+                rows = [{"id": identity} for identity in dict.fromkeys(identities)]
+                answer = tx.query(_properties_read_query(kind, False), given_rows=rows).resolve()
+            documents = self._collect_answer(answer)
+            updates = []
+            for document in documents:
+                try:
+                    properties = json.loads(document["p"]) if document.get("p") else {}
+                except (TypeError, ValueError):
+                    continue
+                changed = mutate(document["id"], properties)
+                if changed is not None:
+                    updates.append(
+                        {"id": document["id"], "v": json.dumps(changed, cls=JSONEncoder)}
+                    )
+            if updates:
+                tx.query(_attr_update_query(kind, "properties-json"), given_rows=updates).resolve()
+            tx.commit()
+        return {update["id"] for update in updates}
+
+    async def _mutate_properties(self, kind: str, identities, mutate) -> set[str]:
+        await self._provision_database()
+        for attempt in range(COMMIT_RETRIES):
+            try:
+                return await self._run_sync(self._mutate_properties_sync, kind, identities, mutate)
+            except Exception as error:
+                if attempt + 1 == COMMIT_RETRIES or not self._is_commit_conflict(error):
+                    raise
+                await self._backoff(attempt)
+        return set()
 
     @classmethod
     def _concept_to_value(cls, concept) -> Any:
@@ -714,7 +938,25 @@ class TypeDBAdapter(GraphDBInterface):
             node_props.setdefault("id", str(node))
             row = self._row_from_properties(str(node), node_props, "node")
         row["now"] = _now_ms()
-        await self._write_batch([(_node_upsert_template(False, False), [row])])
+        await self._write_batch([(_NODE_UPSERT, [row])])
+
+    @staticmethod
+    def _fold_transition(source_ref_key: str | None, pipeline_run_id):
+        """The provenance transition folded into add_nodes/add_edges, or None.
+
+        Delegates to cognee's ``provenance_after_attach`` (Model A: a key's run
+        mapping is recorded only when the key is new to the artifact).
+        """
+        if source_ref_key is None:
+            return None
+        try:
+            get_dataset_id_from_source_ref_key(source_ref_key)
+        except ValueError as error:
+            raise ValueError(
+                "source_ref_key must be built with cognee's make_source_ref_key()"
+            ) from error
+        run = str(pipeline_run_id) if pipeline_run_id is not None else None
+        return lambda keys, run_refs: provenance_after_attach(keys, run_refs, [source_ref_key], run)
 
     async def add_nodes(
         self,
@@ -724,24 +966,23 @@ class TypeDBAdapter(GraphDBInterface):
     ) -> None:
         """Upsert a batch of DataPoints in chunked, concurrent transactions.
 
-        Provenance stamps are added when provided (they accumulate per node).
-        Rows sharing a node id collapse to the last one, so a batch never
-        races itself on the node-id key.
+        With ``source_ref_key`` the provenance attach is folded into each
+        chunk's transaction. Rows sharing a node id collapse to the last one.
         """
         if not nodes:
             return
+        transition = self._fold_transition(source_ref_key, pipeline_run_id)
         now = _now_ms()
         rows: dict[str, dict[str, Any]] = {}
         for node in nodes:
             row = self._node_row(node)
             row["now"] = now
-            if source_ref_key is not None:
-                row["ref"] = source_ref_key
-            if pipeline_run_id is not None:
-                row["run"] = str(pipeline_run_id)
             rows[row["id"]] = row
-        template = _node_upsert_template(source_ref_key is not None, pipeline_run_id is not None)
-        await self._write_rows(template, list(rows.values()))
+        await self._write_rows(
+            _NODE_UPSERT,
+            list(rows.values()),
+            provenance=("node", "id", transition) if transition else None,
+        )
 
     async def extract_node(self, node_id: str):
         return await self.get_node(node_id)
@@ -806,39 +1047,45 @@ class TypeDBAdapter(GraphDBInterface):
     ) -> None:
         """Upsert a batch of edges in chunked, concurrent transactions.
 
-        Edge identity is the edge-key "{source}|{target}|{relationship}";
-        properties are replaced on re-add and duplicate identities within a
-        batch collapse to the last row. Provenance stamps are added when
-        provided. Edges whose endpoints are missing are skipped (cognee adds
-        nodes before edges).
+        Edge identity is the edge-key; properties are replaced on re-add and
+        duplicate identities within a batch collapse to the last row. With
+        ``source_ref_key`` the provenance attach is folded into each chunk's
+        transaction. Edges whose endpoints are missing are skipped (cognee
+        adds nodes before edges).
         """
         if not edges:
             return
+        transition = self._fold_transition(source_ref_key, pipeline_run_id)
         now = _now_ms()
         rows: dict[str, dict[str, Any]] = {}
         for source_id, target_id, relationship_name, properties in edges:
+            source_id, target_id = str(source_id), str(target_id)
             edge_properties = {
                 **(properties or {}),
-                "source_node_id": str(source_id),
-                "target_node_id": str(target_id),
+                "source_node_id": source_id,
+                "target_node_id": target_id,
                 "relationship_name": relationship_name,
             }
-            key = _edge_key(str(source_id), str(target_id), relationship_name)
-            row: dict[str, Any] = {
+            key = _edge_key(source_id, target_id, relationship_name)
+            rows[key] = {
                 "key": key,
-                "sid": str(source_id),
-                "tid": str(target_id),
+                "sid": source_id,
+                "tid": target_id,
                 "rel": relationship_name,
+                "eoid": str(
+                    edge_properties.get("edge_object_id")
+                    or generate_edge_object_id(source_id, target_id, relationship_name)
+                ),
                 "props": json.dumps(edge_properties, cls=JSONEncoder),
                 "now": now,
             }
-            if source_ref_key is not None:
-                row["ref"] = source_ref_key
-            if pipeline_run_id is not None:
-                row["run"] = str(pipeline_run_id)
-            rows[key] = row
-        template = _edge_upsert_template(source_ref_key is not None, pipeline_run_id is not None)
-        await self._write_rows(template, list(rows.values()), _SET_EDGE_CREATED_AT, "key")
+        await self._write_rows(
+            _EDGE_UPSERT,
+            list(rows.values()),
+            _SET_EDGE_CREATED_AT,
+            "key",
+            provenance=("edge", "key", transition) if transition else None,
+        )
 
     async def get_edges(self, node_id: str):
         """Edges incident to a node, anchor-first: (node_id, neighbour_id, {...}).
@@ -1321,6 +1568,347 @@ class TypeDBAdapter(GraphDBInterface):
         raise SearchTypeNotSupported(
             "Temporal search is not yet supported with the TypeDBAdapter graph backend."
         )
+
+    # ------------------------------------------------------------------
+    # Graph provenance (cognee's 15-method contract) and parity methods
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _edge_identity_key(edge: EdgeIdentity) -> str:
+        return _edge_key(str(edge.source_id), str(edge.target_id), edge.relationship_name)
+
+    async def attach_node_source_refs(self, node_ids, source_ref_keys, pipeline_run_id=None):
+        if not source_ref_keys:
+            return
+        add_keys = list(source_ref_keys)
+        await self._provenance_change(
+            "node",
+            node_ids,
+            lambda keys, refs: provenance_after_attach(keys, refs, add_keys, pipeline_run_id),
+        )
+
+    async def attach_edge_source_refs(self, edges, source_ref_keys, pipeline_run_id=None):
+        if not source_ref_keys:
+            return
+        add_keys = list(source_ref_keys)
+        await self._provenance_change(
+            "edge",
+            [self._edge_identity_key(edge) for edge in edges],
+            lambda keys, refs: provenance_after_attach(keys, refs, add_keys, pipeline_run_id),
+        )
+
+    async def remove_node_source_refs(self, node_ids, source_ref_keys):
+        if not source_ref_keys:
+            return
+        remove_keys = list(source_ref_keys)
+        await self._provenance_change(
+            "node", node_ids, lambda keys, refs: provenance_after_remove(keys, refs, remove_keys)
+        )
+
+    async def remove_edge_source_refs(self, edges, source_ref_keys):
+        if not source_ref_keys:
+            return
+        remove_keys = list(source_ref_keys)
+        await self._provenance_change(
+            "edge",
+            [self._edge_identity_key(edge) for edge in edges],
+            lambda keys, refs: provenance_after_remove(keys, refs, remove_keys),
+        )
+
+    async def delete_edge_triples(self, edges) -> None:
+        """Delete the given edges only; their endpoint nodes are kept."""
+        if not edges:
+            return
+        rows = [{"id": self._edge_identity_key(edge)} for edge in edges]
+        await self._write_batch([(_DELETE_EDGES_BY_KEY, rows)])
+
+    def _snapshot_columns(self, document: dict) -> ProvenanceColumns:
+        keys, run_refs, _stored = self._decode_provenance(document)
+        return ProvenanceColumns(keys, derive_dataset_ids(keys), derive_run_ids(run_refs), run_refs)
+
+    async def get_node_delete_data(self, node_ids) -> dict[str, NodeDeleteData]:
+        if not node_ids:
+            return {}
+        rows = [{"id": str(node_id)} for node_id in dict.fromkeys(node_ids)]
+        documents = (await self._read_batch([(_NODE_DELETE_DATA, rows)]))[0]
+        result: dict[str, NodeDeleteData] = {}
+        for document in documents:
+            node_doc = document["node"]
+            node_id = node_doc["node-id"]
+            properties = self._document_to_node_dict(node_doc)
+            metadata = properties.get("metadata") or {}
+            indexed_fields = (
+                list(metadata.get("index_fields") or []) if isinstance(metadata, dict) else []
+            )
+            columns = self._snapshot_columns(document)
+            result[node_id] = NodeDeleteData(
+                node_id=node_id,
+                node_type=str(properties.get("type") or node_doc.get("node-type") or ""),
+                indexed_fields=indexed_fields,
+                node_properties=properties,
+                source_ref_keys=columns.source_ref_keys,
+                source_dataset_ids=columns.source_dataset_ids,
+                source_run_ids=columns.source_run_ids,
+                source_run_refs=columns.source_run_refs,
+            )
+        return result
+
+    async def get_edge_delete_data(self, edges) -> dict[EdgeIdentity, EdgeDeleteData]:
+        if not edges:
+            return {}
+        # Lazy import: the modules layer imports get_graph_engine at package
+        # load, which would form a cycle with this adapter module.
+        from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+
+        rows = [{"id": self._edge_identity_key(edge)} for edge in edges]
+        documents = (await self._read_batch([(_EDGE_DELETE_DATA, rows)]))[0]
+        result: dict[EdgeIdentity, EdgeDeleteData] = {}
+        for document in documents:
+            edge = EdgeIdentity(
+                document["source"], document["target"], document["relationship_name"]
+            )
+            properties = self._document_to_edge_properties(document["edge"])
+            columns = self._snapshot_columns(document)
+            result[edge] = EdgeDeleteData(
+                edge=edge,
+                edge_text=get_edge_retrieval_text(
+                    properties.get("edge_text"), edge.relationship_name
+                ),
+                edge_properties=properties,
+                source_ref_keys=columns.source_ref_keys,
+                source_dataset_ids=columns.source_dataset_ids,
+                source_run_ids=columns.source_run_ids,
+                source_run_refs=columns.source_run_refs,
+            )
+        return result
+
+    async def _nodes_by_attribute(self, attribute: str, value: str) -> list[dict]:
+        query = _NODES_BY_ATTR.format(attribute=attribute)
+        return (await self._read_batch([(query, [{"v": value}])]))[0]
+
+    async def _edges_by_attribute(self, attribute: str, value: str) -> list[dict]:
+        query = _EDGES_BY_ATTR.format(attribute=attribute)
+        return (await self._read_batch([(query, [{"v": value}])]))[0]
+
+    @staticmethod
+    def _edge_identity_of(document: dict) -> EdgeIdentity:
+        return EdgeIdentity(document["source"], document["target"], document["relationship_name"])
+
+    async def find_nodes_by_source_ref(self, source_ref_key: str) -> list[str]:
+        return [
+            doc["id"] for doc in await self._nodes_by_attribute("source-ref-key", source_ref_key)
+        ]
+
+    async def find_edges_by_source_ref(self, source_ref_key: str) -> list[EdgeIdentity]:
+        documents = await self._edges_by_attribute("source-ref-key", source_ref_key)
+        return [self._edge_identity_of(doc) for doc in documents]
+
+    def _keys_owned_by_dataset(self, document: dict, dataset_id: str) -> list[str]:
+        keys, _refs, _stored = self._decode_provenance(document)
+        return [key for key in keys if str(get_dataset_id_from_source_ref_key(key)) == dataset_id]
+
+    def _keys_contributed_by_run(self, document: dict, pipeline_run_id: str) -> list[str]:
+        _keys, run_refs, _stored = self._decode_provenance(document)
+        return [
+            get_source_ref_key_from_source_run_ref(ref)
+            for ref in run_refs
+            if str(get_pipeline_run_id_from_source_run_ref(ref)) == pipeline_run_id
+        ]
+
+    async def find_node_source_refs_by_dataset(self, dataset_id: str) -> dict[str, list[str]]:
+        result = {}
+        for doc in await self._nodes_by_attribute("source-dataset-id", dataset_id):
+            owned = self._keys_owned_by_dataset(doc, dataset_id)
+            if owned:
+                result[doc["id"]] = owned
+        return result
+
+    async def find_edge_source_refs_by_dataset(
+        self, dataset_id: str
+    ) -> dict[EdgeIdentity, list[str]]:
+        result = {}
+        for doc in await self._edges_by_attribute("source-dataset-id", dataset_id):
+            owned = self._keys_owned_by_dataset(doc, dataset_id)
+            if owned:
+                result[self._edge_identity_of(doc)] = owned
+        return result
+
+    async def find_node_source_refs_by_pipeline_run(
+        self, pipeline_run_id: str
+    ) -> dict[str, list[str]]:
+        result = {}
+        for doc in await self._nodes_by_attribute("source-run-id", pipeline_run_id):
+            contributed = self._keys_contributed_by_run(doc, pipeline_run_id)
+            if contributed:
+                result[doc["id"]] = contributed
+        return result
+
+    async def find_edge_source_refs_by_pipeline_run(
+        self, pipeline_run_id: str
+    ) -> dict[EdgeIdentity, list[str]]:
+        result = {}
+        for doc in await self._edges_by_attribute("source-run-id", pipeline_run_id):
+            contributed = self._keys_contributed_by_run(doc, pipeline_run_id)
+            if contributed:
+                result[self._edge_identity_of(doc)] = contributed
+        return result
+
+    async def set_graph_metadata(self, metadata: dict[str, str]) -> None:
+        if not metadata:
+            return
+        rows = [{"k": str(key), "v": str(value)} for key, value in metadata.items()]
+        await self._write_batch([(_METADATA_SET, rows)])
+
+    async def get_graph_metadata(self) -> dict[str, str]:
+        return {doc["k"]: doc["v"] for doc in (await self._read_batch([_METADATA_GET]))[0]}
+
+    async def remove_belongs_to_set_tags(self, tags, node_ids=None) -> None:
+        if not tags or (node_ids is not None and not node_ids):
+            return None
+        tag_set = set(tags)
+
+        def mutate(_node_id, properties):
+            current = properties.get("belongs_to_set")
+            if not isinstance(current, list) or not any(tag in tag_set for tag in current):
+                return None
+            return {**properties, "belongs_to_set": [tag for tag in current if tag not in tag_set]}
+
+        identities = None if node_ids is None else [str(node_id) for node_id in node_ids]
+        await self._mutate_properties("node", identities, mutate)
+        return None
+
+    # --- feedback / truth weights (stored in properties-json, as Ladybug does;
+    # CogneeGraph reads feedback_weight from the projected properties) ---
+
+    @staticmethod
+    def _valid_ids(ids) -> list[str]:
+        return [identity for identity in ids if isinstance(identity, str) and identity]
+
+    async def get_node_feedback_weights(self, node_ids) -> dict[str, float]:
+        valid = self._valid_ids(node_ids)
+        if not valid:
+            return {}
+        result = {}
+        for node in await self.get_nodes(valid):
+            try:
+                result[node["id"]] = float(node.get("feedback_weight", 0.5))
+            except (TypeError, ValueError):
+                result[node["id"]] = 0.5
+        return result
+
+    async def set_node_feedback_weights(self, node_feedback_weights) -> dict[str, bool]:
+        if not node_feedback_weights:
+            return {}
+        valid = self._valid_ids(node_feedback_weights)
+        updated = set()
+        if valid:
+            updated = await self._mutate_properties(
+                "node",
+                valid,
+                lambda node_id, props: {
+                    **props,
+                    "feedback_weight": float(node_feedback_weights[node_id]),
+                },
+            )
+        return {node_id: node_id in updated for node_id in node_feedback_weights}
+
+    async def get_node_truth_state(self, node_ids) -> dict[str, dict[str, Any]]:
+        valid = self._valid_ids(node_ids)
+        if not valid:
+            return {}
+        result = {}
+        for node in await self.get_nodes(valid):
+            alignment = node.get("truth_alignment", [])
+            epoch = node.get("truth_epoch")
+            try:
+                truth_epoch = int(epoch) if epoch is not None else None
+            except (TypeError, ValueError):
+                truth_epoch = None
+            result[node["id"]] = {
+                "truth_alignment": list(alignment) if isinstance(alignment, (list, tuple)) else [],
+                "truth_epoch": truth_epoch,
+            }
+        return result
+
+    async def set_node_truth_state(self, node_truth_state) -> dict[str, bool]:
+        if not node_truth_state:
+            return {}
+        valid = self._valid_ids(node_truth_state)
+
+        def mutate(node_id, props):
+            state = node_truth_state[node_id]
+            updated = {**props, "truth_alignment": list(state.get("truth_alignment") or [])}
+            if state.get("truth_epoch") is not None:
+                updated["truth_epoch"] = int(state["truth_epoch"])
+            return updated
+
+        updated = await self._mutate_properties("node", valid, mutate) if valid else set()
+        return {node_id: node_id in updated for node_id in node_truth_state}
+
+    async def _edges_by_object_ids(self, edge_object_ids) -> list[dict]:
+        rows = [{"v": edge_object_id} for edge_object_id in dict.fromkeys(edge_object_ids)]
+        return (await self._read_batch([(_EDGES_BY_OBJECT_ID, rows)]))[0]
+
+    async def get_edge_feedback_weights(self, edge_object_ids) -> dict[str, float]:
+        valid = self._valid_ids(edge_object_ids)
+        if not valid:
+            return {}
+        result = {}
+        for document in await self._edges_by_object_ids(valid):
+            properties = self._document_to_edge_properties({"properties-json": document.get("p")})
+            try:
+                result[document["eoid"]] = float(properties.get("feedback_weight", 0.5))
+            except (TypeError, ValueError):
+                result[document["eoid"]] = 0.5
+        return result
+
+    async def set_edge_feedback_weights(self, edge_feedback_weights) -> dict[str, bool]:
+        if not edge_feedback_weights:
+            return {}
+        valid = self._valid_ids(edge_feedback_weights)
+        found = (
+            {doc["key"]: doc["eoid"] for doc in await self._edges_by_object_ids(valid)}
+            if valid
+            else {}
+        )
+        updated_keys = set()
+        if found:
+            updated_keys = await self._mutate_properties(
+                "edge",
+                list(found),
+                lambda key, props: {
+                    **props,
+                    "feedback_weight": float(edge_feedback_weights[found[key]]),
+                },
+            )
+        updated = {found[key] for key in updated_keys}
+        return {
+            edge_object_id: edge_object_id in updated for edge_object_id in edge_feedback_weights
+        }
+
+    async def get_triplets_batch(self, offset: int, limit: int) -> list[dict[str, Any]]:
+        """Edges as {start_node, relationship_properties, end_node}, ordered by edge-key."""
+        if offset < 0:
+            raise ValueError(f"Offset must be non-negative, got {offset}")
+        if limit < 0:
+            raise ValueError(f"Limit must be non-negative, got {limit}")
+        if limit == 0:
+            return []
+        query = _TRIPLETS_BATCH.format(offset=int(offset), limit=int(limit))
+        triplets = []
+        for document in (await self._read_batch([query]))[0]:
+            edge_doc = document["edge"]
+            triplets.append(
+                {
+                    "start_node": self._document_to_node_dict(document["start"]),
+                    "relationship_properties": {
+                        **self._document_to_edge_properties(edge_doc),
+                        "relationship_name": edge_doc.get("relationship-name"),
+                    },
+                    "end_node": self._document_to_node_dict(document["end"]),
+                }
+            )
+        return triplets
 
     async def is_empty(self) -> bool:
         results = await self._read_batch(["match $n isa node; limit 1; reduce $count = count;"])

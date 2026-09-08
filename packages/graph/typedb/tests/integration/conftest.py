@@ -8,6 +8,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from cognee.infrastructure.databases.provenance import make_source_ref_key
 from support import ADDRESS, Concept, server_available
 
 from cognee_community_graph_adapter_typedb import TypeDBAdapter
@@ -33,19 +34,25 @@ async def adapter():
 
 @pytest.fixture
 async def seeded(adapter):
-    """The standard test graph: ml -> ai, dl -> ml (is_subset_of), dl -> ai (related_to)."""
+    """The standard test graph: ml -> ai, dl -> ml (is_subset_of), dl -> ai (related_to).
+
+    Every node and edge carries one provenance key (``seeded.key``) attached
+    by pipeline run ``seeded.run``.
+    """
+    dataset_id, data_id, run_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    key = make_source_ref_key(dataset_id, data_id)
     ai = Concept(name="artificial intelligence", description='the "broad" field')
     ml = Concept(name="machine learning")
     dl = Concept(name="deep learning")
-    await adapter.add_nodes([ai, ml, dl], source_ref_key="ds:test", pipeline_run_id="run-1")
+    await adapter.add_nodes([ai, ml, dl], source_ref_key=key, pipeline_run_id=str(run_id))
     await adapter.add_edges(
         [
             (str(ml.id), str(ai.id), "is_subset_of", {"weight": 1}),
             (str(dl.id), str(ml.id), "is_subset_of", {}),
             (str(dl.id), str(ai.id), "related_to", None),
         ],
-        source_ref_key="ds:test",
-        pipeline_run_id="run-1",
+        source_ref_key=key,
+        pipeline_run_id=str(run_id),
     )
     return SimpleNamespace(
         adapter=adapter,
@@ -53,4 +60,7 @@ async def seeded(adapter):
         ml=str(ml.id),
         dl=str(dl.id),
         concepts={"ai": ai, "ml": ml, "dl": dl},
+        key=key,
+        dataset=str(dataset_id),
+        run=str(run_id),
     )

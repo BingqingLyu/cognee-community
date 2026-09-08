@@ -31,17 +31,21 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from cognee.infrastructure.databases.provenance import make_source_ref_key
 from cognee.infrastructure.engine import DataPoint
+from cognee.modules.engine.utils import generate_edge_object_id
 
 from cognee_community_graph_adapter_typedb import TypeDBAdapter
 from cognee_community_graph_adapter_typedb.typedb_adapter import (
+    _EDGE_UPSERT,
+    _NODE_UPSERT,
     _SET_EDGE_CREATED_AT,
     _edge_key,
-    _edge_upsert_template,
-    _node_upsert_template,
     _now_ms,
 )
 
+SOURCE_REF_KEY = make_source_ref_key(uuid.uuid4(), uuid.uuid4())
+RUN_1, RUN_2 = str(uuid.uuid4()), str(uuid.uuid4())
 RELATIONSHIPS = ["is_a", "contains", "mentions", "related_to", "part_of"]
 
 
@@ -106,9 +110,9 @@ def node_specs(adapter: TypeDBAdapter, nodes, chunk: int | None):
     rows = []
     for node in nodes:
         row = adapter._node_row(node)
-        row.update({"now": now, "ref": "bench", "run": "run-1"})
+        row["now"] = now
         rows.append(row)
-    template = _node_upsert_template(True, True)
+    template = _NODE_UPSERT
     size = chunk or len(rows)
     return [[(template, rows[i : i + size])] for i in range(0, len(rows), size)]
 
@@ -123,13 +127,12 @@ def edge_specs(edges, chunk: int | None):
                 "sid": source,
                 "tid": target,
                 "rel": rel,
+                "eoid": generate_edge_object_id(source, target, rel),
                 "props": json.dumps({**props, "source_node_id": source, "target_node_id": target}),
                 "now": now,
-                "ref": "bench",
-                "run": "run-1",
             }
         )
-    template = _edge_upsert_template(True, True)
+    template = _EDGE_UPSERT
     size = chunk or len(rows)
     return [
         [
@@ -173,21 +176,21 @@ async def bench_size(address: str, size: int, chunk_sizes: list[int]) -> list[Re
         await timed(
             "nodes: current (1 query, 1 tx)",
             size,
-            adapter.add_nodes(nodes, source_ref_key="bench", pipeline_run_id="run-1"),
+            adapter.add_nodes(nodes, source_ref_key=SOURCE_REF_KEY, pipeline_run_id=RUN_1),
         )
     )
     results.append(
         await timed(
             "edges: current (1 query, 1 tx)",
             len(edges),
-            adapter.add_edges(edges, source_ref_key="bench", pipeline_run_id="run-1"),
+            adapter.add_edges(edges, source_ref_key=SOURCE_REF_KEY, pipeline_run_id=RUN_1),
         )
     )
     results.append(
         await timed(
             "nodes: re-upsert (update path)",
             size,
-            adapter.add_nodes(nodes, source_ref_key="bench", pipeline_run_id="run-2"),
+            adapter.add_nodes(nodes, source_ref_key=SOURCE_REF_KEY, pipeline_run_id=RUN_2),
         )
     )
     # read side on the loaded graph
@@ -259,7 +262,7 @@ async def bench_concurrency(address: str, writers: int, per_writer: int) -> list
             len(all_nodes),
             asyncio.gather(
                 *(
-                    a.add_nodes(s, source_ref_key="bench", pipeline_run_id="r")
+                    a.add_nodes(s, source_ref_key=SOURCE_REF_KEY, pipeline_run_id=RUN_1)
                     for a, s in zip(adapters, slices, strict=True)
                 )
             ),
@@ -272,7 +275,10 @@ async def bench_concurrency(address: str, writers: int, per_writer: int) -> list
             "parallel, 1 shared driver",
             len(all_nodes),
             asyncio.gather(
-                *(shared.add_nodes(s, source_ref_key="bench", pipeline_run_id="r2") for s in slices)
+                *(
+                    shared.add_nodes(s, source_ref_key=SOURCE_REF_KEY, pipeline_run_id=RUN_2)
+                    for s in slices
+                )
             ),
         )
     )
@@ -284,7 +290,7 @@ async def bench_concurrency(address: str, writers: int, per_writer: int) -> list
 
 async def _sequential(adapter, slices):
     for s in slices:
-        await adapter.add_nodes(s, source_ref_key="bench", pipeline_run_id="r")
+        await adapter.add_nodes(s, source_ref_key=SOURCE_REF_KEY, pipeline_run_id=RUN_1)
 
 
 async def main():

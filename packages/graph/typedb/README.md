@@ -119,9 +119,11 @@ from the main cognee repository.
 ## Features
 
 - Implements Cognee's full `GraphDBInterface`: node/edge CRUD, traversal,
-  `get_graph_data`, and the analytics tier (`get_graph_metrics`,
+  `get_graph_data`, the analytics tier (`get_graph_metrics`,
   `get_nodeset_subgraph`, `get_neighborhood`, `get_disconnected_nodes`,
-  `get_filtered_graph_data`)
+  `get_filtered_graph_data`), graph-native provenance (source refs, dataset /
+  pipeline-run lookups, graph metadata, `delete_edge_triples`), node/edge
+  feedback weights, node truth state, and `get_triplets_batch`
 - Async API; the synchronous TypeDB driver runs on a small dedicated thread pool
 - Batched writes: one compiled TypeQL query per batch, values passed through
   the `given` stage (never string-interpolated)
@@ -137,11 +139,31 @@ labels and relationship names are stored as `node-type`/`relationship-name`
 attributes, the full property payload is serialized into `properties-json`
 (the canonical record), and each edge carries an explicit
 `edge-key` (`"{source}|{target}|{relationship}"`) as its identity.
-Provenance stamps (`source-ref-key`, `source-run-id`) are multi-valued and
-accumulate across pipeline runs. Timestamps are epoch milliseconds: a node's
-`created-at` mirrors its DataPoint's own `created_at`, an edge's is set on
-first write, and `updated-at` is the write time. A typed per-DataPoint schema
-mode is a planned follow-up.
+Timestamps are epoch milliseconds: a node's `created-at` mirrors its
+DataPoint's own `created_at`, an edge's is set on first write, and
+`updated-at` is the write time. A typed per-DataPoint schema mode is a
+planned follow-up.
+
+### Provenance
+
+Cognee's graph-native provenance (the `attach_*_source_refs` /
+`find_*_by_*` / `get_*_delete_data` family) is implemented with cognee's own
+transition functions, so attach/remove semantics match the built-in adapters
+exactly, including "Model A": a pipeline run is recorded against a source
+ref only when that ref is newly attached. Each node and edge stores the
+ordered provenance record in `provenance-json` (the canonical copy, since
+TypeDB's multi-valued attributes are unordered and cognee asserts attach
+order) and mirrors it into four multi-valued lookup attributes
+(`source-ref-key`, `source-dataset-id`, `source-run-id`, `source-run-ref`).
+`add_nodes` / `add_edges` fold the attach into each chunk's transaction:
+upsert, read the current record, apply the transition, write the diff,
+commit. Explicit attach/remove calls do the same in one transaction; all
+provenance writes retry on TypeDB commit conflicts.
+
+Feedback weights (`feedback_weight`) and truth state (`truth_alignment`,
+`truth_epoch`) live inside `properties-json`, where `CogneeGraph` reads them
+from the projected properties; edge weights are addressed by cognee's
+`edge_object_id`, stored as the `edge-object-id` attribute.
 
 The schema define is idempotent and re-applied on every fresh adapter, so
 additive schema changes reach existing databases; incompatible changes need
@@ -161,6 +183,9 @@ a fresh database.
   `get_document_subgraph` / `get_degree_one_nodes` are not implemented; that
   path is only reachable for data ingested before cognee 1.4.x's relational
   provenance ledger.
+- Frequency weights (`get_node_frequency_weights` /
+  `get_edge_frequency_weights`) raise `NotImplementedError`, as on every
+  cognee adapter.
 
 ## Example
 

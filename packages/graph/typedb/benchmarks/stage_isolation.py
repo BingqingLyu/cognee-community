@@ -14,12 +14,14 @@ import json
 import time
 import uuid
 
+from cognee.modules.engine.utils import generate_edge_object_id
+
 from cognee_community_graph_adapter_typedb import TypeDBAdapter
 from cognee_community_graph_adapter_typedb.typedb_adapter import (
+    _EDGE_UPSERT,
+    _NODE_UPSERT,
     _SET_EDGE_CREATED_AT,
     _edge_key,
-    _edge_upsert_template,
-    _node_upsert_template,
     _now_ms,
 )
 
@@ -37,7 +39,7 @@ insert $n isa node, has node-id == $id, has node-type == $type, has name == $nam
   has properties-json == $props, has updated-at == $now, has created-at == $created;
 """
 PUT_ONLY = "given $id: string;\nput $n isa node, has node-id == $id;"
-PUT_UPDATE = _node_upsert_template(False, False)
+PUT_UPDATE = _NODE_UPSERT
 INSERT_EDGES = """
 given $key: string, $sid: string, $tid: string, $rel: string, $props: string, $now: integer;
 match $s isa node, has node-id == $sid; $t isa node, has node-id == $tid;
@@ -45,7 +47,7 @@ insert $e isa edge, links (source: $s, target: $t), has edge-key == $key,
   has relationship-name == $rel, has properties-json == $props,
   has updated-at == $now, has created-at == $now;
 """
-EDGE_PUT_UPDATE = _edge_upsert_template(False, False)
+EDGE_PUT_UPDATE = _EDGE_UPSERT
 
 
 def node_rows(count, now):
@@ -77,6 +79,7 @@ def edge_rows(count, node_count, now):
                 "sid": sid,
                 "tid": tid,
                 "rel": rel,
+                "eoid": generate_edge_object_id(sid, tid, rel),
                 "props": json.dumps({"w": i}),
                 "now": now,
             }

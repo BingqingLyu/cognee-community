@@ -111,3 +111,36 @@ def test_cypher_and_temporal_search_types_are_gated():
         asyncio.run(adapter.collect_time_ids(time_from=1, time_to=2))
     with pytest.raises(SearchTypeNotSupported):
         asyncio.run(adapter.collect_events(ids=["x"]))
+
+
+async def test_provenance_fold_validates_source_ref_key_offline():
+    """A malformed source_ref_key is rejected before any server contact."""
+    from uuid import uuid4
+
+    from cognee.infrastructure.databases.provenance import make_source_ref_key
+    from cognee.infrastructure.databases.provenance.source_ref_state import (
+        provenance_after_attach,
+    )
+
+    from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
+
+    assert TypeDBAdapter._fold_transition(None, "run") is None
+    with pytest.raises(ValueError):
+        TypeDBAdapter._fold_transition("ds:test", "run")
+
+    key, run = make_source_ref_key(uuid4(), uuid4()), str(uuid4())
+    transition = TypeDBAdapter._fold_transition(key, run)
+    assert transition([], []) == provenance_after_attach([], [], [key], run)
+
+
+def test_decode_provenance_prefers_ordered_json_over_set_index():
+    from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
+
+    keys, refs, stored = TypeDBAdapter._decode_provenance(
+        {"pj": '{"keys": ["b", "a"], "run_refs": ["r"]}', "keys": ["a", "b"], "runrefs": ["r"]}
+    )
+    assert (keys, refs) == (["b", "a"], ["r"])
+    assert stored.source_ref_keys == ["a", "b"]
+
+    keys, refs, _ = TypeDBAdapter._decode_provenance({"pj": "not json", "keys": ["a"]})
+    assert (keys, refs) == (["a"], [])

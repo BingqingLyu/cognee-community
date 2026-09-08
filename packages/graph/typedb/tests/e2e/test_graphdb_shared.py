@@ -56,3 +56,58 @@ async def test_delete_dataset_drops_its_typedb_database(e2e_config, monkeypatch)
     assert await database_exists(database_name)
     await delete_dataset(dataset)
     assert not await database_exists(database_name)
+
+
+async def test_graph_native_delete_removes_exclusive_nodes(e2e_config, monkeypatch):
+    """Cognee marks a fresh TypeDB graph as provenance-backed and deletes one
+    document's exclusive nodes through the graph, not the relational ledger
+    (mirrors cognee's ``test_delete_default_graph_non_mocked``)."""
+    from cognee.api.v1.datasets import datasets
+    from cognee.infrastructure.databases.graph import get_graph_engine
+    from cognee.infrastructure.databases.provenance import make_source_ref_key
+    from cognee.infrastructure.databases.provenance.markers import stores_provenance_in_graph
+    from cognee.modules.users.methods import get_default_user
+
+    monkeypatch.setenv("ENABLE_BACKEND_ACCESS_CONTROL", "false")
+    await cognee.prune.prune_data()
+    await cognee.prune.prune_system(metadata=True)
+
+    john = await cognee.add(
+        "John works for Apple. He is also affiliated with a non-profit "
+        "organization called 'Food for Hungry'."
+    )
+    marie = await cognee.add("Marie works for Apple as well. She is a software engineer.")
+    johns_data_id = john.data_ingestion_info[0]["data_id"]
+    maries_data_id = marie.data_ingestion_info[0]["data_id"]
+
+    cognify_result = await cognee.cognify()
+    dataset_id = next(iter(cognify_result))
+
+    graph_engine = await get_graph_engine()
+    assert await stores_provenance_in_graph(graph_engine)
+
+    async def exclusive_nodes(source_ref_key):
+        node_ids = await graph_engine.find_nodes_by_source_ref(source_ref_key)
+        node_data = await graph_engine.get_node_delete_data(node_ids)
+        return {
+            node_id
+            for node_id, data in node_data.items()
+            if set(data.source_ref_keys) == {source_ref_key}
+        }
+
+    john_nodes = await exclusive_nodes(make_source_ref_key(dataset_id, johns_data_id))
+    marie_nodes = await exclusive_nodes(make_source_ref_key(dataset_id, maries_data_id))
+    assert john_nodes and marie_nodes
+
+    user = await get_default_user()
+    await datasets.delete_data(dataset_id, johns_data_id, user)
+
+    assert await graph_engine.get_nodes(list(john_nodes)) == []
+    assert len(await graph_engine.get_nodes(list(marie_nodes))) == len(marie_nodes)
+    nodes, edges = await graph_engine.get_graph_data()
+    assert not any(src in john_nodes or tgt in john_nodes for src, tgt, _, _ in edges)
+    assert not any(node[1].get("name", "").lower() in {"john", "food for hungry"} for node in nodes)
+
+    await datasets.delete_data(dataset_id, maries_data_id, user)
+    final_nodes, final_edges = await graph_engine.get_graph_data()
+    assert (final_nodes, final_edges) == ([], [])

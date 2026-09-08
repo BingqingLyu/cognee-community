@@ -1,5 +1,9 @@
 """Node CRUD round-trips."""
 
+from uuid import UUID, uuid4
+
+import pytest
+from cognee.infrastructure.databases.provenance import make_source_ref_key, make_source_run_ref
 from support import Concept
 
 
@@ -13,7 +17,7 @@ async def test_empty_database(adapter):
 async def test_add_and_get_nodes(adapter):
     ai = Concept(name="artificial intelligence", description='the "broad" field')
     ml = Concept(name="machine learning")
-    await adapter.add_nodes([ai, ml], source_ref_key="ds:test", pipeline_run_id="run-1")
+    await adapter.add_nodes([ai, ml])
 
     assert not await adapter.is_empty()
     assert await adapter.has_node(str(ai.id))
@@ -54,30 +58,37 @@ async def test_add_nodes_with_duplicate_ids_in_one_batch(adapter):
 
 
 async def test_provenance_stamps_accumulate_and_survive_unstamped_upserts(seeded):
-    """source-ref-key / source-run-id are @card(0..): each stamped write adds
-    its ids, and a provenance-less re-add leaves the existing stamps alone."""
+    """The indexed provenance attributes are @card(0..): each stamped write
+    adds its run ref, and a provenance-less re-add leaves existing stamps alone."""
     adapter = seeded.adapter
     ml = seeded.concepts["ml"]
 
     async def stamps():
         rows = await adapter.query(
             "given $id: string; match $n isa node, has node-id == $id,"
-            " has source-ref-key $r, has source-run-id $p; select $r, $p;",
+            " has source-run-ref $r; select $r;",
             {"id": seeded.ml},
         )
-        return {(row["r"], row["p"]) for row in rows}
+        return {row["r"] for row in rows}
 
-    assert await stamps() == {("ds:test", "run-1")}
+    first = make_source_run_ref(UUID(seeded.run), seeded.key)
+    assert await stamps() == {first}
 
     await adapter.add_nodes([Concept(id=ml.id, name="machine learning")])  # unstamped
-    assert await stamps() == {("ds:test", "run-1")}
+    assert await stamps() == {first}
 
+    other_key, other_run = make_source_ref_key(uuid4(), uuid4()), uuid4()
     await adapter.add_nodes(
         [Concept(id=ml.id, name="machine learning")],
-        source_ref_key="ds:test",
-        pipeline_run_id="run-2",
+        source_ref_key=other_key,
+        pipeline_run_id=str(other_run),
     )
-    assert await stamps() == {("ds:test", "run-1"), ("ds:test", "run-2")}
+    assert await stamps() == {first, make_source_run_ref(other_run, other_key)}
+
+
+async def test_add_nodes_rejects_malformed_source_ref_key(adapter):
+    with pytest.raises(ValueError):
+        await adapter.add_nodes([Concept(name="x")], source_ref_key="ds:test")
 
 
 async def test_created_at_mirrors_payload_and_updated_at_moves(adapter):
