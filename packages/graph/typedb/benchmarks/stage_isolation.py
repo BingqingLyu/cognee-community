@@ -41,10 +41,11 @@ insert $n isa node, has node-id == $id, has node-type == $type, has name == $nam
 PUT_ONLY = "given $id: string;\nput $n isa node, has node-id == $id;"
 PUT_UPDATE = _NODE_UPSERT
 INSERT_EDGES = """
-given $key: string, $sid: string, $tid: string, $rel: string, $props: string, $now: integer;
+given $key: string, $sid: string, $tid: string, $rel: string, $eoid: string, $props: string,
+  $now: integer;
 match $s isa node, has node-id == $sid; $t isa node, has node-id == $tid;
 insert $e isa edge, links (source: $s, target: $t), has edge-key == $key,
-  has relationship-name == $rel, has properties-json == $props,
+  has relationship-name == $rel, has edge-object-id == $eoid, has properties-json == $props,
   has updated-at == $now, has created-at == $now;
 """
 EDGE_PUT_UPDATE = _EDGE_UPSERT
@@ -91,7 +92,7 @@ async def fresh(address):
     a = TypeDBAdapter(
         graph_database_url=address, database_name=f"cognee_bench_{uuid.uuid4().hex[:8]}"
     )
-    await a._ensure_database()
+    await a._provision_database()
     return a
 
 

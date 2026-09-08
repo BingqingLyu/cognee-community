@@ -125,8 +125,9 @@ from the main cognee repository.
   pipeline-run lookups, graph metadata, `delete_edge_triples`), node/edge
   feedback weights, node truth state, and `get_triplets_batch`
 - Async API; the synchronous TypeDB driver runs on a small dedicated thread pool
-- Batched writes: one compiled TypeQL query per batch, values passed through
-  the `given` stage (never string-interpolated)
+- Batched writes: rows travel through the TypeQL `given` stage (never
+  string-interpolated) in 200-row chunks with four transactions in flight,
+  retried on commit conflicts
 - Raw TypeQL via `graph_engine.query()`, with `given`-based parameters
 - Compatible with Cognee's add/cognify/search and graph visualization
 
@@ -138,7 +139,8 @@ type and a single `edge` relation type (roles `source`/`target`). Cognee's node
 labels and relationship names are stored as `node-type`/`relationship-name`
 attributes, the full property payload is serialized into `properties-json`
 (the canonical record), and each edge carries an explicit
-`edge-key` (`"{source}|{target}|{relationship}"`) as its identity.
+`edge-key` (the JSON triple `["source","target","relationship"]`, so ids
+containing separator characters cannot collide) as its identity.
 Timestamps are epoch milliseconds: a node's `created-at` mirrors its
 DataPoint's own `created_at`, an edge's is set on first write, and
 `updated-at` is the write time. A typed per-DataPoint schema mode is a
@@ -167,7 +169,9 @@ from the projected properties; edge weights are addressed by cognee's
 
 The schema define is idempotent and re-applied on every fresh adapter, so
 additive schema changes reach existing databases; incompatible changes need
-a fresh database.
+a fresh database. Artifacts stamped before `provenance-json` existed still
+report their source-ref keys from the lookup attributes, but not the
+run-to-key pairing (only `source-run-id` was stored then).
 
 ### Limitations
 

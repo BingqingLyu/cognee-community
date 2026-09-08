@@ -85,6 +85,13 @@ the ratios are what matter.
 
 Ranges are across runs; the laptop server is noisy at ±20 %.
 
+These "after" numbers predate Phase 2: `add_nodes`/`add_edges` now also
+fold the provenance attach into each chunk's transaction (a read of the
+chunk's current provenance plus a diff write) whenever a `source_ref_key`
+is passed, as it is in `bulk_insert.py`'s `current` scenario. The
+`chunk-N` scenarios use the bare templates and stay comparable to the
+table; re-measure `current` before quoting it.
+
 ## Server observations worth raising with the TypeDB team
 
 - `match $n isa node, has node-id == $v` (key attribute, bound value) does

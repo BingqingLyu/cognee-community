@@ -7,14 +7,25 @@ are stored as attributes; the full property payload is serialized into the
 ``properties-json`` attribute, which is the canonical record — the promoted
 attributes (``node-type``, ``name``) exist only as query accelerators, mirror
 the JSON, and are always written together with it. Edges carry an explicit
-``edge-key`` (``"{source}|{target}|{relationship}"``) as their identity.
+``edge-key`` (a JSON ``[source, target, relationship]`` triple) as their
+identity and ``edge-object-id`` (cognee's deterministic feedback id).
 
-Provenance attributes (``source-ref-key``, ``source-run-id``) are
-multi-valued stamps outside the payload: each write that provides a value
-adds it, so a node touched by several pipeline runs keeps every run id, and
-a write without provenance leaves existing stamps untouched. A node's
-``created-at`` mirrors its DataPoint payload's ``created_at``; an edge's is
-set once on first write; ``updated-at`` is the write time (all epoch ms).
+Graph-native provenance follows cognee's contract exactly by delegating the
+state transitions to ``provenance_after_attach`` / ``provenance_after_remove``
+(Model A: a pipeline run is recorded against a source ref only when that ref
+is newly attached). Each node and edge keeps the ordered record in
+``provenance-json`` (canonical, because TypeDB's multi-valued attributes are
+unordered and cognee asserts attach order) and mirrors it into four
+multi-valued lookup attributes (``source-ref-key``, ``source-dataset-id``,
+``source-run-id``, ``source-run-ref``). Every provenance change is one
+read-modify-write transaction; ``add_nodes``/``add_edges`` fold the attach
+into the chunk transaction that upserts the rows. Concurrent changes to one
+artifact conflict at commit (``[STC2]``, verified in
+``tests/integration/test_concurrency.py``) and are retried.
+
+A node's ``created-at`` mirrors its DataPoint payload's ``created_at``; an
+edge's is set once on first write; ``updated-at`` is the write time (all
+epoch ms). Feedback weights and truth state live inside ``properties-json``.
 
 Values reach the server through the TypeQL ``given`` stage (driver
 ``given_rows``), never by string interpolation, so queries are compiled once
@@ -57,6 +68,7 @@ from cognee.infrastructure.databases.provenance import (
 )
 from cognee.infrastructure.databases.provenance.source_ref_state import (
     ProvenanceColumns,
+    coerce_run_uuid,
     derive_dataset_ids,
     derive_run_ids,
     provenance_after_attach,
@@ -284,6 +296,14 @@ def _attr_update_query(kind: str, attribute: str) -> str:
     return f"given $id: string, $v: string;\nmatch {match}\nupdate $x has {attribute} == $v;"
 
 
+def _properties_write_query(kind: str) -> str:
+    match = _MATCH_BY_ID[kind]
+    return (
+        f"given $id: string, $v: string, $now: integer;\nmatch {match}\n"
+        "update $x has properties-json == $v; $x has updated-at == $now;"
+    )
+
+
 def _properties_read_query(kind: str, all_artifacts: bool) -> str:
     if all_artifacts:
         key_attr = "node-id" if kind == "node" else "edge-key"
@@ -302,7 +322,8 @@ def _properties_read_query(kind: str, all_artifacts: bool) -> str:
 _NODE_DELETE_DATA = """
 given $id: string;
 match $a isa node-id == $id; $n isa node, has $a;
-fetch { "node": { $n.* }, "pj": $n.provenance-json };
+fetch { "node": { $n.* }, "pj": $n.provenance-json,
+        "keys": [ $n.source-ref-key ], "runrefs": [ $n.source-run-ref ] };
 """
 _EDGE_DELETE_DATA = """
 given $id: string;
@@ -310,7 +331,8 @@ match
   $k isa edge-key == $id; $e isa edge, has $k, links (source: $s, target: $t);
   $s has node-id $sid; $t has node-id $tid; $e has relationship-name $rel;
 fetch { "source": $sid, "target": $tid, "relationship_name": $rel, "edge": { $e.* },
-        "pj": $e.provenance-json };
+        "pj": $e.provenance-json,
+        "keys": [ $e.source-ref-key ], "runrefs": [ $e.source-run-ref ] };
 """
 _DELETE_EDGES_BY_KEY = """
 given $id: string;
@@ -320,14 +342,16 @@ delete $e;
 _NODES_BY_ATTR = """
 given $v: string;
 match $n isa node, has {attribute} == $v, has node-id $id;
-fetch {{ "id": $id, "pj": $n.provenance-json }};
+fetch {{ "id": $id, "pj": $n.provenance-json,
+        "keys": [ $n.source-ref-key ], "runrefs": [ $n.source-run-ref ] }};
 """
 _EDGES_BY_ATTR = """
 given $v: string;
 match
   $e isa edge, has {attribute} == $v, links (source: $s, target: $t);
   $s has node-id $sid; $t has node-id $tid; $e has relationship-name $rel;
-fetch {{ "source": $sid, "target": $tid, "relationship_name": $rel, "pj": $e.provenance-json }};
+fetch {{ "source": $sid, "target": $tid, "relationship_name": $rel, "pj": $e.provenance-json,
+        "keys": [ $e.source-ref-key ], "runrefs": [ $e.source-run-ref ] }};
 """
 _EDGES_BY_OBJECT_ID = """
 given $v: string;
@@ -754,6 +778,7 @@ class TypeDBAdapter(GraphDBInterface):
                 rows = [{"id": identity} for identity in dict.fromkeys(identities)]
                 answer = tx.query(_properties_read_query(kind, False), given_rows=rows).resolve()
             documents = self._collect_answer(answer)
+            now = _now_ms()
             updates = []
             for document in documents:
                 try:
@@ -763,14 +788,34 @@ class TypeDBAdapter(GraphDBInterface):
                 changed = mutate(document["id"], properties)
                 if changed is not None:
                     updates.append(
-                        {"id": document["id"], "v": json.dumps(changed, cls=JSONEncoder)}
+                        {
+                            "id": document["id"],
+                            "v": json.dumps(changed, cls=JSONEncoder),
+                            "now": now,
+                        }
                     )
             if updates:
-                tx.query(_attr_update_query(kind, "properties-json"), given_rows=updates).resolve()
+                tx.query(_properties_write_query(kind), given_rows=updates).resolve()
             tx.commit()
         return {update["id"] for update in updates}
 
     async def _mutate_properties(self, kind: str, identities, mutate) -> set[str]:
+        """Read-modify-write ``properties-json`` through ``mutate``; see the
+        sync primitive. ``identities=None`` scans every artifact in a READ
+        transaction first and writes only the candidates, so the write
+        transaction (and any STC2 retry) touches the rows it changes."""
+        if identities is None:
+            documents = (await self._read_batch([_properties_read_query(kind, True)]))[0]
+            identities = []
+            for document in documents:
+                try:
+                    properties = json.loads(document["p"]) if document.get("p") else {}
+                except (TypeError, ValueError):
+                    continue
+                if mutate(document["id"], properties) is not None:
+                    identities.append(document["id"])
+        if not identities:
+            return set()
         await self._provision_database()
         for attempt in range(COMMIT_RETRIES):
             try:
@@ -941,7 +986,18 @@ class TypeDBAdapter(GraphDBInterface):
         await self._write_batch([(_NODE_UPSERT, [row])])
 
     @staticmethod
-    def _fold_transition(source_ref_key: str | None, pipeline_run_id):
+    def _run_id(pipeline_run_id) -> str | None:
+        """Validate a pipeline run id (UUID or its string form) before any
+        server contact; cognee's transition would otherwise fail mid-transaction."""
+        if pipeline_run_id is None:
+            return None
+        try:
+            return str(coerce_run_uuid(pipeline_run_id))
+        except ValueError as error:
+            raise ValueError(f"pipeline_run_id must be a UUID, got {pipeline_run_id!r}") from error
+
+    @classmethod
+    def _fold_transition(cls, source_ref_key: str | None, pipeline_run_id):
         """The provenance transition folded into add_nodes/add_edges, or None.
 
         Delegates to cognee's ``provenance_after_attach`` (Model A: a key's run
@@ -955,7 +1011,7 @@ class TypeDBAdapter(GraphDBInterface):
             raise ValueError(
                 "source_ref_key must be built with cognee's make_source_ref_key()"
             ) from error
-        run = str(pipeline_run_id) if pipeline_run_id is not None else None
+        run = cls._run_id(pipeline_run_id)
         return lambda keys, run_refs: provenance_after_attach(keys, run_refs, [source_ref_key], run)
 
     async def add_nodes(
@@ -1067,15 +1123,19 @@ class TypeDBAdapter(GraphDBInterface):
                 "relationship_name": relationship_name,
             }
             key = _edge_key(source_id, target_id, relationship_name)
+            # CogneeGraph reads edge_object_id from the projected properties,
+            # so the derived id is written into the payload as well.
+            edge_object_id = str(
+                edge_properties.get("edge_object_id")
+                or generate_edge_object_id(source_id, target_id, relationship_name)
+            )
+            edge_properties.setdefault("edge_object_id", edge_object_id)
             rows[key] = {
                 "key": key,
                 "sid": source_id,
                 "tid": target_id,
                 "rel": relationship_name,
-                "eoid": str(
-                    edge_properties.get("edge_object_id")
-                    or generate_edge_object_id(source_id, target_id, relationship_name)
-                ),
+                "eoid": edge_object_id,
                 "props": json.dumps(edge_properties, cls=JSONEncoder),
                 "now": now,
             }
@@ -1580,21 +1640,21 @@ class TypeDBAdapter(GraphDBInterface):
     async def attach_node_source_refs(self, node_ids, source_ref_keys, pipeline_run_id=None):
         if not source_ref_keys:
             return
-        add_keys = list(source_ref_keys)
+        add_keys, run = list(source_ref_keys), self._run_id(pipeline_run_id)
         await self._provenance_change(
             "node",
             node_ids,
-            lambda keys, refs: provenance_after_attach(keys, refs, add_keys, pipeline_run_id),
+            lambda keys, refs: provenance_after_attach(keys, refs, add_keys, run),
         )
 
     async def attach_edge_source_refs(self, edges, source_ref_keys, pipeline_run_id=None):
         if not source_ref_keys:
             return
-        add_keys = list(source_ref_keys)
+        add_keys, run = list(source_ref_keys), self._run_id(pipeline_run_id)
         await self._provenance_change(
             "edge",
             [self._edge_identity_key(edge) for edge in edges],
-            lambda keys, refs: provenance_after_attach(keys, refs, add_keys, pipeline_run_id),
+            lambda keys, refs: provenance_after_attach(keys, refs, add_keys, run),
         )
 
     async def remove_node_source_refs(self, node_ids, source_ref_keys):

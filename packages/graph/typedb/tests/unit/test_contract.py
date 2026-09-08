@@ -126,7 +126,9 @@ async def test_provenance_fold_validates_source_ref_key_offline():
 
     assert TypeDBAdapter._fold_transition(None, "run") is None
     with pytest.raises(ValueError):
-        TypeDBAdapter._fold_transition("ds:test", "run")
+        TypeDBAdapter._fold_transition("ds:test", str(uuid4()))
+    with pytest.raises(ValueError):
+        TypeDBAdapter._fold_transition(make_source_ref_key(uuid4(), uuid4()), "run-1")
 
     key, run = make_source_ref_key(uuid4(), uuid4()), str(uuid4())
     transition = TypeDBAdapter._fold_transition(key, run)

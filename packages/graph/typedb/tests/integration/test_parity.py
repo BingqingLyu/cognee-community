@@ -7,6 +7,7 @@ from support import Concept
 
 async def test_node_feedback_weights_round_trip(seeded):
     adapter = seeded.adapter
+    # 0.5 is DataPoint's own default, serialized into properties-json on add.
     assert await adapter.get_node_feedback_weights([seeded.ai, "ghost"]) == {seeded.ai: 0.5}
 
     result = await adapter.set_node_feedback_weights({seeded.ai: 0.9, "ghost": 0.1})
@@ -35,6 +36,12 @@ async def test_node_truth_state_round_trip(seeded):
         seeded.ml: {"truth_alignment": ["a", "b"], "truth_epoch": 3}
     }
 
+    # A None epoch leaves the stored epoch alone (Ladybug semantics).
+    await adapter.set_node_truth_state({seeded.ml: {"truth_alignment": ["c"], "truth_epoch": None}})
+    assert await adapter.get_node_truth_state([seeded.ml]) == {
+        seeded.ml: {"truth_alignment": ["c"], "truth_epoch": 3}
+    }
+
 
 async def test_edge_feedback_weights_round_trip(seeded):
     adapter = seeded.adapter
@@ -52,6 +59,7 @@ async def test_edge_feedback_weights_round_trip(seeded):
     # A caller-supplied edge_object_id wins over the derived one.
     await adapter.add_edge(seeded.dl, seeded.ai, "related_to", {"edge_object_id": "custom"})
     assert await adapter.set_edge_feedback_weights({"custom": 0.7}) == {"custom": True}
+    assert await adapter.get_edge_feedback_weights(["custom"]) == {"custom": 0.7}
 
 
 async def test_get_triplets_batch_pages_in_stable_order(seeded):
@@ -72,7 +80,9 @@ async def test_get_triplets_batch_pages_in_stable_order(seeded):
         (seeded.dl, "is_subset_of", seeded.ml),
         (seeded.dl, "related_to", seeded.ai),
     }
-    assert all(t["start_node"]["name"] for t in triplets)
+    # memify's triplet consumer skips any node dict without a "type".
+    assert all(t["start_node"]["name"] and t["start_node"]["type"] == "Concept" for t in triplets)
+    assert all(t["end_node"]["type"] == "Concept" for t in triplets)
     weighted = next(t for t in triplets if t["start_node"]["id"] == seeded.ml)
     assert weighted["relationship_properties"]["weight"] == 1
 

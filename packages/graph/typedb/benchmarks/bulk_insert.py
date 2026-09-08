@@ -3,8 +3,9 @@
 Measures the adapter's write path under different batching strategies so the
 "rows per query / queries per transaction" decision rests on numbers:
 
-  current     one `given` query carrying every row, one transaction (what
-              add_nodes/add_edges do today)
+  current     add_nodes/add_edges as shipped: 200-row chunks, 4 transactions
+              in flight, plus the provenance fold (read + diff write) per
+              chunk because a source_ref_key is passed
   chunk-N/tx  rows split into `given` queries of N rows, all pipelined in ONE
               transaction
   chunk-N/ptx rows split into N-row queries, one transaction PER chunk
@@ -128,7 +129,14 @@ def edge_specs(edges, chunk: int | None):
                 "tid": target,
                 "rel": rel,
                 "eoid": generate_edge_object_id(source, target, rel),
-                "props": json.dumps({**props, "source_node_id": source, "target_node_id": target}),
+                "props": json.dumps(
+                    {
+                        **props,
+                        "source_node_id": source,
+                        "target_node_id": target,
+                        "relationship_name": rel,
+                    }
+                ),
                 "now": now,
             }
         )
@@ -155,7 +163,7 @@ async def fresh_adapter(address: str) -> TypeDBAdapter:
     adapter = TypeDBAdapter(
         graph_database_url=address, database_name=f"cognee_bench_{uuid.uuid4().hex[:8]}"
     )
-    await adapter._ensure_database()
+    await adapter._provision_database()
     return adapter
 
 
@@ -174,14 +182,14 @@ async def bench_size(address: str, size: int, chunk_sizes: list[int]) -> list[Re
     adapter = await fresh_adapter(address)
     results.append(
         await timed(
-            "nodes: current (1 query, 1 tx)",
+            "nodes: current (add_nodes)",
             size,
             adapter.add_nodes(nodes, source_ref_key=SOURCE_REF_KEY, pipeline_run_id=RUN_1),
         )
     )
     results.append(
         await timed(
-            "edges: current (1 query, 1 tx)",
+            "edges: current (add_edges)",
             len(edges),
             adapter.add_edges(edges, source_ref_key=SOURCE_REF_KEY, pipeline_run_id=RUN_1),
         )
@@ -255,7 +263,7 @@ async def bench_concurrency(address: str, writers: int, per_writer: int) -> list
     # one adapter (= one driver) per writer, same database
     database = f"cognee_bench_{uuid.uuid4().hex[:8]}"
     adapters = [TypeDBAdapter(graph_database_url=address, database_name=database) for _ in slices]
-    await adapters[0]._ensure_database()
+    await adapters[0]._provision_database()
     results.append(
         await timed(
             f"parallel, {writers} drivers",
