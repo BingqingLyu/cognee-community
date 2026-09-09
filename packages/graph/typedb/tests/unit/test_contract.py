@@ -78,7 +78,16 @@ def test_dataset_database_name_derivation_and_validation():
     )
     with pytest.raises(ValueError):
         TypeDBDatasetDatabaseHandler._database_name_for_dataset(None)
-    for foreign in ("cognee", "typedb", "cognee_../x", "cognee_" + "a" * 70, ""):
+    for foreign in (
+        "cognee",
+        "typedb",
+        "cognee_../x",
+        "cognee_" + "a" * 70,
+        "",
+        "cognee_e2e",
+        "cognee_test_abc",
+        "cognee_" + "A" * 32,
+    ):
         with pytest.raises(ValueError):
             TypeDBDatasetDatabaseHandler._validate_database_name(foreign)
 
@@ -158,12 +167,22 @@ def test_tls_config_from_environment():
 
 
 def test_tls_root_ca_must_exist(tmp_path):
+    from typedb.driver import TypeDBDriverExceptionNative
+
     from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
 
-    with pytest.raises(Exception, match=r"(?i)ca|tls|file|path"):
+    with pytest.raises(TypeDBDriverExceptionNative, match="No such file"):
         TypeDBAdapter._tls_config(
             {"TYPEDB_TLS": "1", "TYPEDB_TLS_ROOT_CA": str(tmp_path / "x.pem")}
         )
+
+
+def test_tls_flag_rejects_non_boolean_values():
+    from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
+
+    for value in ("enabled", "ture", "t"):
+        with pytest.raises(ValueError, match="TYPEDB_TLS"):
+            TypeDBAdapter._tls_config({"TYPEDB_TLS": value})
 
 
 def test_handler_rejects_half_configured_credentials():
@@ -184,6 +203,7 @@ def test_handler_rejects_half_configured_credentials():
         return SimpleNamespace(**{**fields, **overrides})
 
     assert handler._connection_settings(config()) == ("127.0.0.1:1729", None, None)
+    assert handler._connection_settings(config(graph_database_url="")) == (None, None, None)
     assert handler._connection_settings(
         config(graph_database_username="u", graph_database_password="p")
     ) == (

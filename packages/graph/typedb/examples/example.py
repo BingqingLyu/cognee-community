@@ -1,6 +1,6 @@
 """Example usage of the TypeDB community adapter for Cognee.
 
-Requires a running TypeDB 3.x server (default: 127.0.0.1:1729) and an LLM
+Requires a running TypeDB 3.12+ server (default: 127.0.0.1:1729) and an LLM
 API key in the environment (see the repo README).
 """
 
@@ -23,7 +23,7 @@ async def main():
     cognee.config.set_graph_database_provider("typedb")
     register()
 
-    # Set up your TypeDB connection (TypeDB 3.x, default credentials shown)
+    # Set up your TypeDB connection (TypeDB 3.12+, default credentials shown)
     cognee.config.set_graph_db_config(
         {
             "graph_database_url": os.environ.get("GRAPH_DATABASE_URL", "127.0.0.1:1729"),

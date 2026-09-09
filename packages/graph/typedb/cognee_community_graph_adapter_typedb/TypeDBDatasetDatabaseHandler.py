@@ -40,8 +40,9 @@ from .typedb_adapter import TypeDBAdapter
 
 TYPEDB_DATASET_DATABASE_HANDLER = "typedb"
 TYPEDB_DATASET_DATABASE_PREFIX = "cognee_"
-# TypeDB database names: keep to a conservative identifier alphabet.
-TYPEDB_DATABASE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{2,62}$")
+# The only shape this handler creates (prefix + 32-hex dataset uuid); anything
+# else is refused on delete, however it got there.
+TYPEDB_DATABASE_NAME_PATTERN = re.compile(rf"^{TYPEDB_DATASET_DATABASE_PREFIX}[0-9a-f]{{32}}$")
 
 
 class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
@@ -86,7 +87,14 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
     async def resolve_dataset_connection_info(
         cls, dataset_database: DatasetDatabase
     ) -> DatasetDatabase:
-        """Attach credentials from the live config; nothing is written back."""
+        """Attach credentials from the live config; nothing is written back.
+
+        Cognee hands over a detached row and discards it after connecting.
+        The JSON column is re-assigned (not mutated in place) so that, should
+        a future caller resolve inside an open session, SQLAlchemy would see
+        the change rather than silently persist stale data; do not resolve
+        inside a session that is later committed.
+        """
         url, username, password = cls._connection_settings(get_graph_config())
         info = dict(dataset_database.graph_database_connection_info or {})
         info.setdefault("graph_database_username", username)
@@ -144,7 +152,7 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
             driver.databases.get(adapter.database_name).delete()
 
     @staticmethod
-    def _connection_settings(graph_config) -> tuple[str, str | None, str | None]:
+    def _connection_settings(graph_config) -> tuple[str | None, str | None, str | None]:
         """(url, username, password) for the service account, validated.
 
         TypeDB has no anonymous access: a username without a password (or the

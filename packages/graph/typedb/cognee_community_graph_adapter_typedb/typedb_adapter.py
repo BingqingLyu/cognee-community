@@ -457,13 +457,18 @@ class TypeDBAdapter(GraphDBInterface):
 
         ``TYPEDB_TLS`` unset or false: plaintext. True: TLS with the system's
         native trust roots, or with the PEM bundle at ``TYPEDB_TLS_ROOT_CA``
-        when that is set (self-signed / private CA deployments).
+        when that is set (self-signed / private CA deployments). Any other
+        value is an error rather than a silent fall back to plaintext.
+        The mode is process-wide: cognee caches one engine per dataset, so a
+        change to these variables takes effect on the next driver open.
         """
         from typedb.driver import DriverTlsConfig
 
-        enabled = environ.get(TLS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
-        if not enabled:
+        value = environ.get(TLS_ENV, "").strip().lower()
+        if value in {"", "0", "false", "no", "off"}:
             return DriverTlsConfig.disabled()
+        if value not in {"1", "true", "yes", "on"}:
+            raise ValueError(f"{TLS_ENV}={value!r} is not a boolean (use true or false)")
         root_ca = environ.get(TLS_ROOT_CA_ENV, "").strip()
         if root_ca:
             return DriverTlsConfig.enabled_with_root_ca(root_ca)

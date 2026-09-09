@@ -24,23 +24,12 @@ from cognee.modules.users.methods import create_user
 from cognee.modules.users.permissions.methods import authorized_give_permission_on_datasets
 from cognee.tasks.storage import add_data_points
 from pydantic import BaseModel
-from support import ADDRESS, database_exists, graph_db_config, server_available
+from support import ADDRESS, database_exists, server_available
 
 pytestmark = [
     pytest.mark.skipif(os.environ.get("RUN_E2E_TESTS") != "1", reason="set RUN_E2E_TESTS=1"),
     pytest.mark.skipif(not server_available(), reason=f"no TypeDB server at {ADDRESS}"),
 ]
-
-
-class Organization(DataPoint):
-    name: str
-    metadata: dict = {"index_fields": ["name"]}
-
-
-class Person(DataPoint):
-    name: str
-    works_for: list[Organization]
-    metadata: dict = {"index_fields": ["name"]}
 
 
 class DataItem(BaseModel):
@@ -50,13 +39,23 @@ class DataItem(BaseModel):
 @pytest.fixture
 def access_control_config(typedb_config, isolated_roots, monkeypatch):
     monkeypatch.setenv("ENABLE_BACKEND_ACCESS_CONTROL", "true")
-    cognee.config.set_graph_db_config(graph_db_config())
 
 
 async def test_dataset_permissions_gate_graph_deletes(access_control_config):
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
     await setup()
+
+    # Defined here, as in cognee's original: module-level DataPoint subclasses
+    # would sit in DataPoint.__subclasses__() for every other test's searches.
+    class Organization(DataPoint):
+        name: str
+        metadata: dict = {"index_fields": ["name"]}
+
+    class Person(DataPoint):
+        name: str
+        works_for: list[Organization]
+        metadata: dict = {"index_fields": ["name"]}
 
     company_a = Organization(name="Company A")
     company_b = Organization(name="Company B")
@@ -68,11 +67,11 @@ async def test_dataset_permissions_gate_graph_deletes(access_control_config):
     dataset = await create_authorized_dataset(dataset_name="tenant_dataset", user=owner)
     john_item, jane_item = DataItem(id=uuid4()), DataItem(id=uuid4())
 
-    await set_database_global_context_variables(dataset.id, dataset.owner_id)
-    for person, item in ((john, john_item), (jane, jane_item)):
-        await add_data_points(
-            [person], ctx=PipelineContext(user=owner, dataset=dataset, data_item=item)
-        )
+    async with set_database_global_context_variables(dataset.id, dataset.owner_id):
+        for person, item in ((john, john_item), (jane, jane_item)):
+            await add_data_points(
+                [person], ctx=PipelineContext(user=owner, dataset=dataset, data_item=item)
+            )
 
     # The dataset's graph lives in its own TypeDB database.
     graph_engine = await get_graph_engine()

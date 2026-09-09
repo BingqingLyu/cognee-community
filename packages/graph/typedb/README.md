@@ -33,7 +33,7 @@ async def main():
     # Configure cognee to use TypeDB
     cognee.config.set_graph_database_provider("typedb")
 
-    # Set up your TypeDB connection (TypeDB 3.x, default credentials shown)
+    # Set up your TypeDB connection (TypeDB 3.12+, default credentials shown)
     cognee.config.set_graph_db_config(
         {
             "graph_database_url": "127.0.0.1:1729",
@@ -119,7 +119,7 @@ export GRAPH_DATABASE_PASSWORD="password"
 Cognee's backend access control (on by default in cognee 1.x) maps each
 dataset to its own graph database through a dataset database handler. This
 package registers one for TypeDB — one TypeDB database per dataset, named
-`cognee_<dataset uuid>` — under the handler key `typedb`. Select it alongside
+`cognee_<dataset uuid hex>` — under the handler key `typedb`. Select it alongside
 the provider, either in `set_graph_db_config()` (as in the Usage example) or
 via the environment:
 
@@ -139,7 +139,7 @@ opened.
 | `ENABLE_BACKEND_ACCESS_CONTROL` | Graph layout | When to use |
 |---|---|---|
 | `true` (cognee default) | One TypeDB database per dataset, `cognee_<uuid>`; cognee's user/role/tenant permissions gate every read, write, and delete | Multi-user or multi-tenant deployments, per-dataset lifecycle (delete a dataset, drop its database) |
-| `false` | One shared database (`graph_database_name`, default `cognee`) for every dataset and user | Single-user scripts, notebooks, benchmarks |
+| `false` | One shared database (`graph_database_name`, default `cognee`) for every dataset and user; `prune_system` empties it but keeps the database | Single-user scripts, notebooks, benchmarks |
 
 What the isolation does and does not give you:
 
@@ -155,10 +155,10 @@ What the isolation does and does not give you:
   with neither set it uses the development defaults.
 - **Lifecycle.** `create_dataset` provisions the database and defines the
   schema up front, so a wrong address or bad credentials fail at dataset
-  creation rather than mid-cognify. `delete_dataset` and `prune_system` drop
-  the database; the handler refuses to drop anything not named
-  `cognee_<uuid hex>`. Reads on a dropped database see an empty graph and
-  never recreate it.
+  creation rather than mid-cognify. Under access control, `delete_dataset`
+  and `prune_system` drop the database; the handler refuses to drop anything
+  not named `cognee_<32 hex chars>`, the only shape it ever creates. Reads on
+  a dropped database see an empty graph and never recreate it.
 - **Housekeeping.** Every dataset database is visible to the server's
   standard tooling (`typedb console`, the driver's `databases.all()`), and
   `cognee_<uuid hex>` names map back to `dataset.id.hex` in cognee's
@@ -255,7 +255,7 @@ resulting TypeDB database through raw TypeQL.
 
 ```bash
 uv run pytest tests/unit -q           # offline contract tests, no server needed
-uv run pytest tests/integration -q    # adapter against TypeDB on 127.0.0.1:1729
+uv run pytest tests/integration -q    # adapter against TypeDB on 127.0.0.1:1729 (or GRAPH_DATABASE_URL)
 RUN_E2E_TESTS=1 uv run pytest tests/e2e -q   # cognee's shared suite, graph-native delete, permissions (+ LLM key)
 ```
 
