@@ -90,17 +90,28 @@ def edge_rows(count, node_count, now):
     return rows
 
 
+OPEN: list[TypeDBAdapter] = []  # benchmark databases not yet dropped
+
+
 async def fresh(address):
     a = TypeDBAdapter(
         graph_database_url=address, database_name=f"cognee_bench_{uuid.uuid4().hex[:8]}"
     )
     await a._provision_database()
+    OPEN.append(a)
     return a
 
 
 async def drop(a):
+    OPEN.remove(a)
     a._get_driver().databases.get(a.database_name).delete()
     await a.close()
+
+
+async def drop_all_open():
+    """Drop whatever a failed scenario left behind (runs from main's finally)."""
+    for a in list(OPEN):
+        await drop(a)
 
 
 async def timed(label, rows, coro):
@@ -204,11 +215,14 @@ async def main():
     p.add_argument("--sizes", default="50,100,250,500")
     p.add_argument("--concurrency", type=int, default=4)
     args = p.parse_args()
-    await stages(args.address, args.rows)
-    await tx_sweep(
-        args.address, args.rows, [int(s) for s in args.sizes.split(",")], args.concurrency
-    )
-    print("\nDone.")
+    try:
+        await stages(args.address, args.rows)
+        await tx_sweep(
+            args.address, args.rows, [int(s) for s in args.sizes.split(",")], args.concurrency
+        )
+        print("\nDone.")
+    finally:
+        await drop_all_open()
 
 
 if __name__ == "__main__":

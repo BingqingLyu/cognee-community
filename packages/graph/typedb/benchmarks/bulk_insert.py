@@ -159,17 +159,28 @@ async def run_chunked(adapter, chunks, per_chunk_transaction: bool):
         await adapter._write_batch([spec for specs in chunks for spec in specs])
 
 
+OPEN: list[TypeDBAdapter] = []  # benchmark databases not yet dropped
+
+
 async def fresh_adapter(address: str) -> TypeDBAdapter:
     adapter = TypeDBAdapter(
         graph_database_url=address, database_name=f"cognee_bench_{uuid.uuid4().hex[:8]}"
     )
     await adapter._provision_database()
+    OPEN.append(adapter)
     return adapter
 
 
 async def drop(adapter: TypeDBAdapter):
+    OPEN.remove(adapter)
     adapter._get_driver().databases.get(adapter.database_name).delete()
     await adapter.close()
+
+
+async def drop_all_open():
+    """Drop whatever a failed scenario left behind (runs from main's finally)."""
+    for adapter in list(OPEN):
+        await drop(adapter)
 
 
 async def bench_size(address: str, size: int, chunk_sizes: list[int]) -> list[Result]:
@@ -264,6 +275,7 @@ async def bench_concurrency(address: str, writers: int, per_writer: int) -> list
     database = f"cognee_bench_{uuid.uuid4().hex[:8]}"
     adapters = [TypeDBAdapter(graph_database_url=address, database_name=database) for _ in slices]
     await adapters[0]._provision_database()
+    OPEN.append(adapters[0])  # registers the shared database for drop-on-failure
     results.append(
         await timed(
             f"parallel, {writers} drivers",
@@ -290,8 +302,8 @@ async def bench_concurrency(address: str, writers: int, per_writer: int) -> list
             ),
         )
     )
-    shared._get_driver().databases.get(database).delete()
-    for a in adapters:
+    await drop(shared)
+    for a in adapters[1:]:
         await a.close()
     return results
 
@@ -312,10 +324,13 @@ async def main():
     chunks = [int(c) for c in args.chunks.split(",")]
 
     results = []
-    for size in sizes:
-        results += await bench_size(args.address, size, chunks)
-    results += await bench_concurrency(args.address, args.writers, max(sizes) // args.writers)
-    print("\nDone.")
+    try:
+        for size in sizes:
+            results += await bench_size(args.address, size, chunks)
+        results += await bench_concurrency(args.address, args.writers, max(sizes) // args.writers)
+        print("\nDone.")
+    finally:
+        await drop_all_open()
 
 
 if __name__ == "__main__":
