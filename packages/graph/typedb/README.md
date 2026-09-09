@@ -212,15 +212,16 @@ ordered provenance record in `provenance-json` (the canonical copy, since
 TypeDB's multi-valued attributes are unordered and cognee asserts attach
 order) and mirrors it into four multi-valued lookup attributes
 (`source-ref-key`, `source-dataset-id`, `source-run-id`, `source-run-ref`).
-`add_nodes` / `add_edges` upsert their rows in concurrent chunk
-transactions and then attach provenance for the whole batch in serial
-transactions (read the current record, apply the transition, write the
-diff, commit), serialized per adapter. The attach is deliberately not
-folded into the concurrent chunks: TypeDB conflicts concurrent inserts of
+`add_nodes` / `add_edges` fold the attach into each chunk's transaction
+(upsert, read the current record, apply the transition, write the diff,
+commit), so no node or edge is ever visible without its provenance, which
+cognee's rollback and delete planners rely on. Chunks that carry provenance
+run one at a time per adapter: TypeDB conflicts concurrent inserts of
 ownership of the same string value longer than 16 characters, and every
 row of a batch owns the same source-ref key, dataset id and run id (see
-`benchmarks/README.md`). Explicit attach/remove calls use the same path;
-all provenance writes retry on TypeDB commit conflicts.
+`benchmarks/README.md`; serial 100-row chunks also measured fastest).
+Explicit attach/remove calls use the same serialized path; all provenance
+writes retry on TypeDB commit conflicts.
 
 Feedback weights (`feedback_weight`) and truth state (`truth_alignment`,
 `truth_epoch`) live inside `properties-json`, where `CogneeGraph` reads them

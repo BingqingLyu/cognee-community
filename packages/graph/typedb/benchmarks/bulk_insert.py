@@ -3,9 +3,9 @@
 Measures the adapter's write path under different batching strategies so the
 "rows per query / queries per transaction" decision rests on numbers:
 
-  current     add_nodes/add_edges as shipped: 200-row chunks, 4 transactions
-              in flight, plus the provenance fold (read + diff write) per
-              chunk because a source_ref_key is passed
+  current     add_nodes/add_edges as shipped with a source_ref_key: 100-row
+              chunks, each folding the provenance attach into its
+              transaction, run one at a time (see the adapter docstring)
   chunk-N/tx  rows split into `given` queries of N rows, all pipelined in ONE
               transaction
   chunk-N/ptx rows split into N-row queries, one transaction PER chunk

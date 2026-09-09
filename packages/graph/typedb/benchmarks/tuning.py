@@ -12,6 +12,7 @@ each with its own gRPC I/O thread) into one database.
 import argparse
 import asyncio
 import contextlib
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -47,6 +48,7 @@ async def knob_sweep(address, nodes, edges, chunks, concurrencies):
         for chunk in chunks:
             adapter_module.WRITE_CHUNK_ROWS = chunk
             async with fresh(address) as (adapter,):
+                assert (adapter._chunk_rows, adapter._write_concurrency) == (chunk, concurrency)
                 label = f"chunk={chunk:<5} conc={concurrency}"
                 await timed(f"nodes {label}", len(nodes), adapter.add_nodes(nodes))
                 await timed(f"edges {label}", len(edges), adapter.add_edges(edges))
@@ -81,6 +83,9 @@ async def main():
     parser.add_argument("--concurrency", default="1,2,4,8")
     parser.add_argument("--drivers", default="1,2,4")
     args = parser.parse_args()
+    # The sweep sets the module defaults; env overrides would silently win.
+    for name in ("TYPEDB_WRITE_CHUNK_ROWS", "TYPEDB_WRITE_CONCURRENCY"):
+        os.environ.pop(name, None)
     nodes = make_nodes(args.size)
     edges = make_edges(nodes)
     default_chunk, default_conc = adapter_module.WRITE_CHUNK_ROWS, adapter_module.WRITE_CONCURRENCY

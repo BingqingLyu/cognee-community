@@ -225,6 +225,8 @@ def test_write_knobs_from_environment(monkeypatch):
         _positive_int_env,
     )
 
+    for name in ("TYPEDB_WRITE_CHUNK_ROWS", "TYPEDB_WRITE_CONCURRENCY"):
+        monkeypatch.delenv(name, raising=False)
     adapter = TypeDBAdapter()
     assert (adapter._chunk_rows, adapter._write_concurrency) == (
         WRITE_CHUNK_ROWS,

@@ -27,7 +27,7 @@ dev = [
 ]
 # Comparative benchmarks against cognee's built-in Neo4j adapter (benchmarks/).
 bench = [
-    "neo4j>=5.0.0,<6",
+    "neo4j>=5.28.0,<6",  # cognee 1.4.2's own neo4j extra pins the same floor
 ]
 
 [project.urls]

@@ -81,22 +81,28 @@ the ratios are what matter.
 
 Phase 0 (2026-09-04, sequential `UUID(int=i)` test ids, which we later
 found hit a shared-prefix scan on the server, see below) and Phase 4
-(2026-09-09, random ids, serial provenance attach, 100-row chunks):
+(2026-09-09, random ids, 100-row chunks, provenance folded into each chunk
+with provenance chunks run serially):
 
 | | 1,000 nodes / 1,500 edges | 5,000 nodes / 7,500 edges |
 |---|---|---|
-| `add_nodes` (+provenance) | 672 → 3,800 → **2,250–2,400** rows/s | 1,700 → **2,850–3,200** rows/s |
-| `add_edges` (+provenance) | 157 → 1,000 → **1,250** rows/s | 260 → **2,250–2,750** rows/s |
-| re-upsert (update path) | 561 → 2,200 → **5,000–5,700** rows/s | 740 → **6,500–6,700** rows/s |
+| `add_nodes` (+provenance) | 672 → 3,800 → **1,350** rows/s | 1,700 → **2,300** rows/s |
+| `add_edges` (+provenance) | 157 → 1,000 → **1,170** rows/s | 260 → **1,540** rows/s |
+| re-upsert (update path) | 561 → 2,200 → **4,300** rows/s | 740 → **4,300** rows/s |
 | `get_neighborhood` (10 seeds, depth 2) | 1.97 s → 0.17 s → **0.04 s** | 24.6 s → 1.19 s → **0.07 s** |
-| `get_graph_data` | 27k → **21k** rows/s | 25k → **17k** rows/s |
+| `get_graph_data` | 27k → **21k** rows/s | 25k → **18k** rows/s |
 
 Ranges are across runs; the laptop server is noisy at ±20 %. The 1k
-`add_nodes` figure is lower than Phase 0's because the provenance attach
-now runs as a separate serial transaction after the upserts (the folded
-form conflicted, see the STC2 observation); `bulk_insert.py`'s bare
-`chunk-N/ptx` scenarios show the upsert alone at 5,200 (1k) and 7,900 (5k)
-rows/s.
+`add_nodes` figure is below Phase 0's 3,800 because provenance chunks now
+run one at a time (the Phase 0 number was bare upserts with 4 in flight);
+`bulk_insert.py`'s `chunk-N/ptx` scenarios still show the bare upsert at
+5,200 (1k) and 7,900 (5k) rows/s. A two-phase variant (concurrent upserts,
+then one serial attach pass) measured ~30 % faster (5k: 1.55 s / 3.36 s vs
+2.19 s / 4.87 s) and was rejected: it leaves a window, and on a phase-2
+failure a permanent state, where artifacts exist without provenance, which
+cognee's rollback and dataset-delete planners cannot see. The remaining
+lever in the fold is round trips: each chunk's transaction issues one
+provenance read plus up to five diff writes.
 
 ## Phase 4: write-path tuning (2026-09-09)
 
@@ -111,9 +117,12 @@ rows/s:
 | 1000 | 2,419 / 980 | 1,268 / 606 | 1,007 / 471 | 8,251 / 1,440 |
 
 (nodes / edges). Per-row cost grows superlinearly with the rows in a
-transaction: 100-row chunks beat 200 by ~25 % at every concurrency and
-1,000-row chunks are 5–15× slower. Concurrency helps up to 4 and hurts at 8.
-The default moved from 200 to 100 rows per chunk; 4 in flight stays.
+transaction: at concurrency 1, 100- and 200-row chunks are equal; at 2 and
+4 in flight, 100 beats 200 by 12–32 %, and 1,000-row chunks are 2.7–16×
+slower than 100 (the conc-8 / 1,000-row node run at 8,251 rows/s is an
+unexplained outlier that did not reproduce for edges). Concurrency helps up
+to 4 and hurts at 8. The default moved from 200 to 100 rows per chunk; 4
+in flight stays.
 
 **Driver pool: not worth it.** The same rows written through 1, 2 or 4
 adapter instances (one native driver each, 4 transactions in flight per
@@ -137,50 +146,53 @@ already buffered in it.
 ## Phase 4: TypeDB vs Ladybug vs Neo4j (2026-09-09)
 
 `compare_adapters.py` runs one workload through cognee's `GraphDBInterface`
-on each backend: TypeDB 3.12.3 (this adapter, 200-row chunks, 4 in flight),
-Ladybug 0.17.1 (cognee's default, embedded in-process) and Neo4j 5.28
-community (cognee's built-in adapter, dockerized, no GDS plugin). Same
-laptop, same seeded data (random uuid4 ids, 400–900-char payloads), wall
-time per step.
+on each backend: TypeDB 3.12.3 (this adapter as shipped: 100-row chunks,
+4 in flight, provenance folded per chunk and serialized), Ladybug 0.17.1
+(cognee's default, embedded in-process) and Neo4j 5.28 community (cognee's
+built-in adapter, dockerized, no GDS plugin). Same laptop, same seeded data
+(random uuid4 ids, 400–900-char payloads), wall time per step.
 
 | step (5,000 nodes / 7,500 edges) | TypeDB | Ladybug | Neo4j |
 |---|---|---|---|
-| `add_nodes` + provenance | 1.55 s | 0.27 s | 1.14 s |
-| `add_edges` + provenance | 3.36 s | 0.72 s | 1.89 s |
-| re-upsert 5,000 nodes (second run id) | 0.77 s | 0.35 s | 0.91 s |
-| `get_graph_data` (12,500 rows) | 0.76 s | 0.05 s | 2.25 s |
-| `get_neighborhood` (10 seeds, depth 2) | 69 ms | 14 ms | 138 ms |
-| `get_edges` × 100 nodes | 172 ms | 141 ms | 252 ms |
-| `get_id_filtered_graph_data` (200 ids) | 69 ms | 16 ms | 157 ms |
-| `find_nodes_by_source_ref` + `get_node_delete_data` (500) | 157 ms | 15 ms | 704 ms |
-| `delete_nodes` (500) | 185 ms | 21 ms | 73 ms |
-| 4 concurrent `add_nodes` (5,000 total, provenance) | 1.42 s | 0.50 s | 0.54 s |
+| `add_nodes` + provenance | 2.19 s | 0.27 s | 1.14 s |
+| `add_edges` + provenance | 4.87 s | 0.72 s | 1.89 s |
+| re-upsert 5,000 nodes (second run id) | 1.16 s | 0.35 s | 0.91 s |
+| `get_graph_data` (12,500 rows) | 0.68 s | 0.05 s | 2.25 s |
+| `get_neighborhood` (10 seeds, depth 2) | 67 ms | 14 ms | 138 ms |
+| `get_edges` × 100 nodes | 174 ms | 141 ms | 252 ms |
+| `get_id_filtered_graph_data` (200 ids) | 63 ms | 16 ms | 157 ms |
+| `get_graph_metrics` | 0.30 s | 1.00 s | needs GDS |
+| `find_nodes_by_source_ref` + `get_node_delete_data` (500) | 236 ms | 15 ms | 704 ms |
+| `delete_nodes` (500) | 195 ms | 21 ms | 73 ms |
+| 4 concurrent `add_nodes` (5,000 total, provenance) | 2.00 s | 0.50 s | 0.54 s |
 
 | step (1,000 nodes / 1,500 edges) | TypeDB | Ladybug | Neo4j |
 |---|---|---|---|
-| `add_nodes` + provenance | 0.42 s | 0.11 s | 0.25 s |
-| `add_edges` + provenance | 1.21 s | 0.11 s | 0.61 s |
+| `add_nodes` + provenance | 0.74 s | 0.11 s | 0.25 s |
+| `add_edges` + provenance | 1.28 s | 0.11 s | 0.61 s |
+| re-upsert 1,000 nodes | 0.23 s | 0.08 s | 0.20 s |
 | `get_graph_data` (2,500 rows) | 0.12 s | 0.01 s | 0.43 s |
-| `get_neighborhood` (10 seeds, depth 2) | 41 ms | 9 ms | 81 ms |
-| `delete_nodes` (500) | 163 ms | 16 ms | 60 ms |
+| `get_neighborhood` (10 seeds, depth 2) | 40 ms | 9 ms | 81 ms |
+| `get_graph_metrics` | 64 ms | 210 ms | needs GDS |
+| `delete_nodes` (500) | 159 ms | 16 ms | 60 ms |
 
-Reading it:
+Reading it (ratios from the 5k table):
 
-- **Ladybug is 3–15× faster across the board.** It is an embedded engine
-  with no network hop, no transaction commit protocol and no multi-tenant
-  isolation; that is the price of a server, not of this adapter.
-- **Against Neo4j, the other server, TypeDB is 1.3–1.8× slower on bulk
-  writes and 1.5–4.5× faster on the read paths cognee hits most**:
-  `get_graph_data` (projected on every GRAPH_COMPLETION search),
-  neighborhoods, id-filtered projections and the delete planner's
-  provenance lookups.
-- **Where TypeDB loses:** `add_edges` (each edge matches both endpoints by
-  key, then `put`s a relation), `delete_nodes` (edge cascade is a separate
-  query), and concurrent `add_nodes` calls that all carry provenance: the
-  upserts run concurrently but the attach is serialized per adapter (see
-  the STC2 observation below), so four concurrent callers pay for four
-  serial attach transactions.
-- These numbers are with random ids; the Phase 0 tables above were
+- **Ladybug, embedded in-process, is faster at everything except
+  `get_graph_metrics`** (TypeDB 3.4× faster there, at both sizes): 1.2×
+  on `get_edges`, 3–5× on re-upsert, neighborhoods and id-filtered
+  projections, 7–8× on bulk writes, 9–16× on `get_graph_data`, deletes and
+  the delete planner. That is the price of a server with commit isolation
+  and per-dataset databases, not of this adapter.
+- **Against Neo4j, the other server: TypeDB is 1.3–2.6× slower on bulk
+  writes** (re-upsert 1.3×, `add_nodes` 1.9×, `add_edges` 2.6×; 3.7× on
+  four concurrent provenance-carrying `add_nodes` calls, which serialize
+  their chunks) **and 1.5–3.3× faster on the read paths cognee hits most**:
+  `get_graph_data` 3.3× (projected on every GRAPH_COMPLETION search),
+  neighborhoods 2.1×, id-filtered projections 2.5×, the delete planner's
+  provenance lookups 3.0×, `get_edges` 1.5×. `delete_nodes` is 2.7× slower
+  (the edge cascade is a separate query).
+- Both comparisons are with random ids; the Phase 0 tables above were
   measured with sequential `UUID(int=i)` ids, which hit the shared-prefix
   scan described below, and understate TypeDB by 5–20×.
 

@@ -16,7 +16,7 @@ Usage (each backend is optional; skipped when not configured):
 
   python -u benchmarks/compare_adapters.py --sizes 1000,5000 \
       --typedb 127.0.0.1:1729 --ladybug --neo4j bolt://127.0.0.1:7688 \
-      --neo4j-password benchpassword
+      --neo4j-password benchpassword --json results.json
 
 Neo4j needs the `bench` extra (`uv sync --all-extras`) and a disposable
 server: the run WIPES the target Neo4j database.

@@ -18,16 +18,20 @@ is newly attached). Each node and edge keeps the ordered record in
 unordered and cognee asserts attach order) and mirrors it into four
 multi-valued lookup attributes (``source-ref-key``, ``source-dataset-id``,
 ``source-run-id``, ``source-run-ref``). Every provenance change is a
-read-modify-write transaction serialized per adapter; ``add_nodes`` /
-``add_edges`` upsert their rows in concurrent chunk transactions and then
-attach provenance for the whole batch in serial transactions. The two steps
-are not one transaction: TypeDB conflicts concurrent inserts of ownership
-of the same string value longer than 16 characters (benchmarks/README.md),
-and every row of a batch owns the same source-ref key, dataset id and run
-id, so folding the attach into concurrent chunks made every chunk retry.
-Concurrent changes to one artifact from different callers still conflict
-at commit (``[STC2]``, verified in ``tests/integration/test_concurrency.py``)
-and are retried against a re-read of the record.
+read-modify-write transaction. ``add_nodes`` / ``add_edges`` fold the
+attach into each chunk's transaction (upsert, read the record, apply the
+transition, write the diff, commit), so no artifact is ever visible
+without its provenance, the invariant cognee's rollback and delete
+planners rely on. Chunks that carry provenance run one at a time under the
+adapter's provenance lock: TypeDB conflicts concurrent inserts of
+ownership of the same string value longer than 16 characters
+(benchmarks/README.md), every row of a batch owns the same source-ref key,
+dataset id and run id, and pre-creating the attribute does not help, so
+concurrent provenance chunks only retried each other. Serial 100-row
+chunks are in fact the fastest shape measured. Concurrent changes to one
+artifact from different callers still conflict at commit (``[STC2]``,
+verified in ``tests/integration/test_concurrency.py``) and are retried
+against a re-read of the record.
 
 A node's ``created-at`` mirrors its DataPoint payload's ``created_at``; an
 edge's is set once on first write; ``updated-at`` is the write time (all
@@ -260,14 +264,12 @@ select $id;
 # Batch writes are split into transactions of this many rows, with up to
 # WRITE_CONCURRENCY transactions in flight. benchmarks/README.md (Phase 4
 # sweep): per-row cost grows superlinearly with rows per transaction, 100-row
-# chunks beat 200 by ~25% at any concurrency, and 4 in flight is the knee.
+# chunks beat 200 by 12-32% at 2-4 in flight (equal at 1), 4 in flight is the knee.
 # Defaults; per-adapter values come from TYPEDB_WRITE_CHUNK_ROWS /
 # TYPEDB_WRITE_CONCURRENCY when set (read at construction).
 WRITE_CHUNK_ROWS = 100
 WRITE_CONCURRENCY = 4
 COMMIT_RETRIES = 6
-# Artifacts per serial provenance transaction (read + diff write per artifact).
-PROVENANCE_TX_ROWS = 1000
 WRITE_CHUNK_ROWS_ENV = "TYPEDB_WRITE_CHUNK_ROWS"
 WRITE_CONCURRENCY_ENV = "TYPEDB_WRITE_CONCURRENCY"
 
@@ -454,7 +456,8 @@ class TypeDBAdapter(GraphDBInterface):
         self._write_concurrency = _positive_int_env(WRITE_CONCURRENCY_ENV, WRITE_CONCURRENCY)
         # Caps in-flight chunk transactions across ALL concurrent batch calls.
         self._write_semaphore = asyncio.Semaphore(self._write_concurrency)
-        # Serializes explicit provenance attach/remove within this adapter.
+        # Serializes every provenance write within this adapter: folded
+        # add_nodes/add_edges chunks and explicit attach/remove alike.
         self._provenance_lock = asyncio.Lock()
         # Guards driver open/close and executor creation across threads.
         self._state_lock = threading.Lock()
@@ -692,14 +695,20 @@ class TypeDBAdapter(GraphDBInterface):
         rows: list[dict],
         created_query: str | None = None,
         key: str | None = None,
+        provenance=None,
     ):
-        """Upsert rows as chunked transactions, WRITE_CONCURRENCY in flight.
+        """Upsert rows as chunked transactions.
 
         ``created_query`` (with ``key``) adds the set-once created-at statement
-        to each chunk's transaction. The batch is not atomic: on the first
-        failure, chunks not yet started are cancelled, chunks already
-        committed stay committed, and chunks mid-transaction run to
-        completion before the error propagates.
+        to each chunk's transaction. Without ``provenance`` the chunks run
+        with WRITE_CONCURRENCY in flight. With ``provenance`` = (kind,
+        id_field, transition) each chunk's transaction also attaches
+        provenance to the rows it upserted (atomic per chunk), and the
+        chunks run one at a time under the provenance lock (module
+        docstring). Either way the batch is not atomic: on the first failure,
+        chunks not yet started are cancelled, chunks already committed stay
+        committed, and chunks mid-transaction run to completion before the
+        error propagates.
         """
         if not rows:
             return
@@ -712,6 +721,16 @@ class TypeDBAdapter(GraphDBInterface):
                 specs.append((created_query, [{key: row[key], "now": row["now"]} for row in chunk]))
             return specs
 
+        if provenance is not None:
+            kind, id_field, transition = provenance
+            await self._provision_database()
+            async with self._provenance_lock:
+                for chunk in chunks:
+                    await self._write_chunk(
+                        specs_for(chunk), (kind, [row[id_field] for row in chunk], transition)
+                    )
+            return
+
         tasks = [asyncio.create_task(self._write_chunk(specs_for(chunk))) for chunk in chunks]
         try:
             await asyncio.gather(*tasks)
@@ -721,12 +740,21 @@ class TypeDBAdapter(GraphDBInterface):
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-    async def _write_chunk(self, specs) -> None:
+    async def _write_chunk(self, specs, provenance=None) -> None:
+        """One chunk transaction, retried on commit conflicts. With
+        ``provenance`` = (kind, identities, transition) the transaction also
+        applies the provenance transition to those artifacts after the specs."""
         for attempt in range(COMMIT_RETRIES):
             try:
                 # The slot is held only for the attempt, never during backoff.
                 async with self._write_semaphore:
-                    await self._write_batch(specs, retry=False)
+                    if provenance is None:
+                        await self._write_batch(specs, retry=False)
+                    else:
+                        kind, identities, transition = provenance
+                        await self._run_sync(
+                            self._provenance_change_sync, kind, identities, transition, specs
+                        )
                 return
             except Exception as error:
                 if attempt + 1 == COMMIT_RETRIES or not self._is_commit_conflict(error):
@@ -758,17 +786,22 @@ class TypeDBAdapter(GraphDBInterface):
         # The ordered JSON is canonical; fall back to the set index if absent.
         return keys or stored.source_ref_keys, run_refs or stored.source_run_refs, stored
 
-    def _provenance_change_sync(self, kind: str, identities: list[str], transition):
-        """In one WRITE transaction: read each artifact's provenance, apply the
-        pure ``transition``, write the diffs, commit.
+    def _provenance_change_sync(self, kind: str, identities: list[str], transition, pre_specs=()):
+        """In one WRITE transaction: run ``pre_specs`` (a chunk's upserts),
+        read each artifact's provenance, apply the pure ``transition``, write
+        the diffs, commit.
 
-        The read stream is drained before any write is issued (TSV13).
+        The read happens after the pre-specs, so a folded chunk sees the
+        artifacts it just upserted, and its stream is drained before any
+        further write is issued (TSV13).
         """
         from typedb.driver import TransactionType
 
         driver = self._get_driver()
         with driver.transaction(self.database_name, TransactionType.WRITE) as tx:
-            rows = [{"id": identity} for identity in dict.fromkeys(identities)]
+            for query_text, given_rows in pre_specs:
+                tx.query(query_text, given_rows=given_rows).resolve()
+            rows = [{"id": identity} for identity in identities]
             documents = self._collect_answer(
                 tx.query(_provenance_read_query(kind), given_rows=rows).resolve()
             )
@@ -801,27 +834,19 @@ class TypeDBAdapter(GraphDBInterface):
             tx.commit()
 
     async def _provenance_change(self, kind: str, identities, transition) -> None:
-        """Apply ``transition`` to every artifact in ``identities``: serial
-        transactions of up to PROVENANCE_TX_ROWS artifacts, one adapter-wide
-        lock (see the module docstring for why these never run concurrently),
-        each retried on commit conflicts with other writers."""
+        """Explicit attach/remove: apply ``transition`` to every artifact in
+        ``identities`` in serial chunk-sized transactions under the
+        provenance lock, each retried on commit conflicts with other
+        writers. The transition is idempotent, so a retried chunk cannot
+        double-record and committed chunks need no re-run."""
         identities = list(dict.fromkeys(str(identity) for identity in identities))
         if not identities:
             return
         await self._provision_database()
+        size = self._chunk_rows
         async with self._provenance_lock:
-            for start in range(0, len(identities), PROVENANCE_TX_ROWS):
-                slice_ids = identities[start : start + PROVENANCE_TX_ROWS]
-                for attempt in range(COMMIT_RETRIES):
-                    try:
-                        await self._run_sync(
-                            self._provenance_change_sync, kind, slice_ids, transition
-                        )
-                        break
-                    except Exception as error:
-                        if attempt + 1 == COMMIT_RETRIES or not self._is_commit_conflict(error):
-                            raise
-                        await self._backoff(attempt)
+            for start in range(0, len(identities), size):
+                await self._write_chunk([], (kind, identities[start : start + size], transition))
 
     def _mutate_properties_sync(self, kind: str, identities, mutate) -> set[str]:
         """In one WRITE transaction: read properties-json for ``identities``
@@ -1081,9 +1106,9 @@ class TypeDBAdapter(GraphDBInterface):
     ) -> None:
         """Upsert a batch of DataPoints in chunked, concurrent transactions.
 
-        With ``source_ref_key`` the provenance attach follows in serial
-        transactions (see the module docstring). Rows sharing a node id
-        collapse to the last one.
+        With ``source_ref_key`` the provenance attach is folded into each
+        chunk's transaction and chunks run serially (module docstring). Rows
+        sharing a node id collapse to the last one.
         """
         if not nodes:
             return
@@ -1094,9 +1119,11 @@ class TypeDBAdapter(GraphDBInterface):
             row = self._node_row(node)
             row["now"] = now
             rows[row["id"]] = row
-        await self._write_rows(_NODE_UPSERT, list(rows.values()))
-        if transition:
-            await self._provenance_change("node", rows, transition)
+        await self._write_rows(
+            _NODE_UPSERT,
+            list(rows.values()),
+            provenance=("node", "id", transition) if transition else None,
+        )
 
     async def extract_node(self, node_id: str):
         return await self.get_node(node_id)
@@ -1163,9 +1190,9 @@ class TypeDBAdapter(GraphDBInterface):
 
         Edge identity is the edge-key; properties are replaced on re-add and
         duplicate identities within a batch collapse to the last row. With
-        ``source_ref_key`` the provenance attach follows in serial
-        transactions (see the module docstring). Edges whose endpoints are
-        missing are skipped (cognee adds nodes before edges).
+        ``source_ref_key`` the provenance attach is folded into each chunk's
+        transaction and chunks run serially (module docstring). Edges whose
+        endpoints are missing are skipped (cognee adds nodes before edges).
         """
         if not edges:
             return
@@ -1197,9 +1224,13 @@ class TypeDBAdapter(GraphDBInterface):
                 "props": json.dumps(edge_properties, cls=JSONEncoder),
                 "now": now,
             }
-        await self._write_rows(_EDGE_UPSERT, list(rows.values()), _SET_EDGE_CREATED_AT, "key")
-        if transition:
-            await self._provenance_change("edge", rows, transition)
+        await self._write_rows(
+            _EDGE_UPSERT,
+            list(rows.values()),
+            _SET_EDGE_CREATED_AT,
+            "key",
+            provenance=("edge", "key", transition) if transition else None,
+        )
 
     async def get_edges(self, node_id: str):
         """Edges incident to a node, anchor-first: (node_id, neighbour_id, {...}).
