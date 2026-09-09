@@ -1,5 +1,6 @@
 """Shared e2e fixtures: cognee roots isolated per test, TypeDB e2e database config."""
 
+import os
 import re
 import warnings
 
@@ -28,12 +29,14 @@ def isolated_roots(tmp_path):
 
 @pytest.fixture(autouse=True)
 async def sweep_dataset_databases():
-    """Drop per-dataset databases a test leaves behind, and say so.
+    """Report per-dataset databases a test leaves behind; drop them when opted in.
 
     The per-test temp roots take cognee's relational registry with them, so a
     dataset database not dropped by the test itself would be orphaned on the
-    server. Cleaning up is the test's job; this fixture is the safety net
-    and makes a leak visible as a warning instead of a stray database.
+    server. Cleaning up is the test's job; this fixture makes a leak visible.
+    It cannot tell a leaked database from one another process created on the
+    same server during the test, so it only drops with ``TYPEDB_E2E_SWEEP=1``
+    (set in CI, where the server is the job's own container).
     """
     if not server_available():
         yield
@@ -43,10 +46,17 @@ async def sweep_dataset_databases():
     leaked = sorted(
         name for name in await list_databases() - before if DATASET_DATABASE.fullmatch(name)
     )
-    for name in leaked:
-        await drop_database(name)
-    if leaked:
+    if not leaked:
+        return
+    if os.environ.get("TYPEDB_E2E_SWEEP") == "1":
+        for name in leaked:
+            await drop_database(name)
         warnings.warn(f"test left dataset databases behind (dropped): {leaked}", stacklevel=1)
+    else:
+        warnings.warn(
+            f"test left dataset databases behind (kept; TYPEDB_E2E_SWEEP=1 drops them): {leaked}",
+            stacklevel=1,
+        )
 
 
 @pytest.fixture(scope="session", autouse=True)

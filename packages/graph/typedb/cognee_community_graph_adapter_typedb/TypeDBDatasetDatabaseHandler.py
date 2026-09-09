@@ -5,9 +5,10 @@ own graph database through a ``DatasetDatabaseHandlerInterface``. For TypeDB
 that is one server-side database per dataset (``cognee_<dataset uuid hex>``),
 created with the cognee schema on ``create_dataset`` and dropped on
 ``delete_dataset``. Credentials are never persisted: ``create_dataset`` stores
-only the server address and database name, and
-``resolve_dataset_connection_info`` re-derives username/password from the
-live graph config right before a connection is opened.
+only the server address and database name (``graph_database_key`` is not a
+TypeDB concept and is stored empty), and ``resolve_dataset_connection_info``
+re-derives username/password from the live graph config right before a
+connection is opened.
 
 Select it with ``GRAPH_DATASET_DATABASE_HANDLER=typedb`` (cognee's built-in
 provider→handler derivation only knows in-tree providers).
@@ -78,7 +79,7 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
             "graph_database_provider": "typedb",
             "graph_database_url": url,
             "graph_database_name": database_name,
-            "graph_database_key": graph_config.graph_database_key,
+            "graph_database_key": "",  # not a TypeDB concept; never persist another provider's key
             "graph_dataset_database_handler": TYPEDB_DATASET_DATABASE_HANDLER,
             "graph_database_connection_info": {},
         }
@@ -90,22 +91,23 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
         """Attach credentials from the live config; nothing is written back.
 
         Cognee hands over a detached row and discards it after connecting.
-        The JSON column is re-assigned (not mutated in place) so that, should
-        a future caller resolve inside an open session, SQLAlchemy would see
-        the change rather than silently persist stale data; do not resolve
-        inside a session that is later committed.
+        The credentials go into the existing JSON dict in place (as the Neo4j
+        handler does): the column is a plain ``JSON`` without change tracking,
+        so even a caller that resolved inside a committing session would not
+        flush them. Re-assigning the attribute would.
         """
         url, username, password = cls._connection_settings(get_graph_config())
-        info = dict(dataset_database.graph_database_connection_info or {})
+        if dataset_database.graph_database_connection_info is None:
+            dataset_database.graph_database_connection_info = {}
+        info = dataset_database.graph_database_connection_info
         info.setdefault("graph_database_username", username)
         info.setdefault("graph_database_password", password)
-        dataset_database.graph_database_connection_info = info
         if not dataset_database.graph_database_url:
             dataset_database.graph_database_url = url
         return dataset_database
 
     @classmethod
-    async def delete_dataset(cls, dataset_database) -> None:
+    async def delete_dataset(cls, dataset_database: DatasetDatabase | Mapping) -> None:
         """Drop the dataset's database.
 
         Accepts the ``DatasetDatabase`` ORM object (dataset deletion) or the

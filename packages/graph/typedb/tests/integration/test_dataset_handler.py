@@ -113,3 +113,24 @@ async def test_reads_never_recreate_a_dropped_dataset_database(typedb_config):
     finally:
         await adapter.close()
         await drop_database(name)
+
+
+async def test_concurrent_provisioning_of_one_database_is_idempotent(typedb_config):
+    """Two creators for the same dataset (two workers; cognee's dataset lock is
+    per process) must both succeed: the loser of the create race proceeds to
+    the idempotent schema define instead of surfacing the server's error."""
+    import asyncio
+
+    from support import drop_database
+
+    name = f"cognee_{uuid.uuid4().hex}"
+    adapters = [TypeDBAdapter(graph_database_url=ADDRESS, database_name=name) for _ in range(4)]
+    try:
+        await asyncio.gather(*(adapter._provision_database() for adapter in adapters))
+        assert await database_exists(name)
+        await adapters[0].add_nodes([Concept(name="after the race")])
+        assert not await adapters[-1].is_empty()
+    finally:
+        for adapter in adapters:
+            await adapter.close()
+        await drop_database(name)

@@ -487,13 +487,24 @@ class TypeDBAdapter(GraphDBInterface):
                 )
             return self._driver
 
-    def _close_sync(self) -> None:
+    def _detach_sync(self):
+        """Take ownership of the current executor and driver (if any) and reset
+        the adapter to its unopened state, atomically. A call that arrives
+        afterwards opens a fresh pair instead of racing the closing one."""
         with self._state_lock:
-            if self._driver is not None:
-                self._driver.close()
-                self._driver = None
-                self._database_exists = False
-                self._schema_initialized = False
+            executor, driver = self._executor, self._driver
+            self._executor = None
+            self._driver = None
+            self._database_exists = False
+            self._schema_initialized = False
+        return executor, driver
+
+    def _close_sync(self) -> None:
+        executor, driver = self._detach_sync()
+        if executor is not None:
+            executor.shutdown(wait=True)
+        if driver is not None:
+            driver.close()
 
     async def close(self) -> None:
         """Release the native TypeDB connection and worker threads.
@@ -504,12 +515,11 @@ class TypeDBAdapter(GraphDBInterface):
         a live connection. The adapter reopens lazily if used again.
         """
         async with self._lock:
-            with self._state_lock:
-                executor = self._executor
-                self._executor = None
+            executor, driver = self._detach_sync()
             if executor is not None:
                 await asyncio.to_thread(executor.shutdown, True)
-            await asyncio.to_thread(self._close_sync)
+            if driver is not None:
+                await asyncio.to_thread(driver.close)
 
     def _provision_database_sync(self) -> None:
         """Create the database if missing and (re)define the cognee schema.
@@ -523,7 +533,14 @@ class TypeDBAdapter(GraphDBInterface):
 
         driver = self._get_driver()
         if not driver.databases.contains(self.database_name):
-            driver.databases.create(self.database_name)
+            try:
+                driver.databases.create(self.database_name)
+            except Exception:
+                # Lost a race with another creator (cognee's dataset lock is
+                # per process; two workers can provision the same dataset).
+                # The define below is idempotent, so proceed if it now exists.
+                if not driver.databases.contains(self.database_name):
+                    raise
         with driver.transaction(self.database_name, TransactionType.SCHEMA) as tx:
             tx.query(COGNEE_SCHEMA).resolve()
             tx.commit()

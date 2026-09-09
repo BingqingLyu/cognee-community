@@ -29,6 +29,12 @@ from support import ADDRESS, database_exists, server_available
 pytestmark = [
     pytest.mark.skipif(os.environ.get("RUN_E2E_TESTS") != "1", reason="set RUN_E2E_TESTS=1"),
     pytest.mark.skipif(not server_available(), reason=f"no TypeDB server at {ADDRESS}"),
+    # Vectors are written next to the graph: needs an embedding backend (a
+    # hosted one via EMBEDDING_API_KEY, or a local provider such as fastembed).
+    pytest.mark.skipif(
+        not (os.environ.get("EMBEDDING_API_KEY") or os.environ.get("EMBEDDING_PROVIDER")),
+        reason="no embedding backend configured",
+    ),
 ]
 
 

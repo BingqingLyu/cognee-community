@@ -259,6 +259,10 @@ uv run pytest tests/integration -q    # adapter against TypeDB on 127.0.0.1:1729
 RUN_E2E_TESTS=1 uv run pytest tests/e2e -q   # cognee's shared suite, graph-native delete, permissions (+ LLM key)
 ```
 
+The e2e tier warns about any per-dataset database a test leaves on the
+server; set `TYPEDB_E2E_SWEEP=1` (CI does) to have it drop them, which is only
+safe when nothing else uses that server.
+
 ## License
 
 This project is licensed under the MIT License.
