@@ -1,7 +1,13 @@
 """Shared e2e fixtures: cognee roots isolated per test, TypeDB e2e database config."""
 
+import re
+import warnings
+
 import cognee
 import pytest
+from support import E2E_DATABASE, drop_database, list_databases, server_available
+
+DATASET_DATABASE = re.compile(r"cognee_[0-9a-f]{32}")
 
 
 @pytest.fixture
@@ -18,3 +24,54 @@ def isolated_roots(tmp_path):
     yield
     cognee.config.data_root_directory(prev_data_root)
     cognee.config.system_root_directory(prev_system_root)
+
+
+@pytest.fixture(autouse=True)
+async def sweep_dataset_databases():
+    """Drop per-dataset databases a test leaves behind, and say so.
+
+    The per-test temp roots take cognee's relational registry with them, so a
+    dataset database not dropped by the test itself would be orphaned on the
+    server. Cleaning up is the test's job; this fixture is the safety net
+    and makes a leak visible as a warning instead of a stray database.
+    """
+    if not server_available():
+        yield
+        return
+    before = await list_databases()
+    yield
+    leaked = sorted(
+        name for name in await list_databases() - before if DATASET_DATABASE.fullmatch(name)
+    )
+    for name in leaked:
+        await drop_database(name)
+    if leaked:
+        warnings.warn(f"test left dataset databases behind (dropped): {leaked}", stacklevel=1)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def drop_shared_e2e_database():
+    """Drop the tier's shared ``cognee_e2e`` database once the session ends.
+
+    Access-control-off runs write to it, and prune_system only empties a
+    shared database, so it would otherwise outlive the test run. Sync on
+    purpose: a session-scoped async fixture would need its own loop scope.
+    """
+    yield
+    if not server_available():
+        return
+    from support import ADDRESS, PASSWORD, USERNAME
+
+    from cognee_community_graph_adapter_typedb import TypeDBAdapter
+
+    adapter = TypeDBAdapter(
+        graph_database_url=ADDRESS,
+        graph_database_username=USERNAME,
+        graph_database_password=PASSWORD,
+    )
+    try:
+        driver = adapter._get_driver()
+        if driver.databases.contains(E2E_DATABASE):
+            driver.databases.get(E2E_DATABASE).delete()
+    finally:
+        adapter._close_sync()

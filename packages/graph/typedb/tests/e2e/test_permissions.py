@@ -92,5 +92,8 @@ async def test_dataset_permissions_gate_graph_deletes(access_control_config):
     nodes, edges = await graph_engine.get_graph_data()
     assert (len(nodes), len(edges)) == (2, 1)  # Jane and Company B remain
 
-    await datasets.delete_data(dataset.id, jane_item.id, other)
+    # Deleting the last item with delete_dataset_if_empty removes the dataset
+    # and, through the handler, its TypeDB database.
+    await datasets.delete_data(dataset.id, jane_item.id, other, delete_dataset_if_empty=True)
     assert await graph_engine.get_graph_data() == ([], [])
+    assert not await database_exists(graph_engine.database_name)

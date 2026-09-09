@@ -14,9 +14,13 @@ import os
 import cognee
 import pytest
 from cognee.tests.e2e.postgres.test_graphdb_shared import run_graph_db_test
-from support import ADDRESS, database_exists, graph_db_config, server_available
-
-E2E_DATABASE = "cognee_e2e"
+from support import (
+    ADDRESS,
+    E2E_DATABASE,
+    database_exists,
+    graph_db_config,
+    server_available,
+)
 
 pytestmark = [
     pytest.mark.skipif(os.environ.get("RUN_E2E_TESTS") != "1", reason="set RUN_E2E_TESTS=1"),
