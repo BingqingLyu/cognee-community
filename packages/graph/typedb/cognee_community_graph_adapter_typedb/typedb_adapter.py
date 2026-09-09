@@ -258,11 +258,12 @@ select $id;
 """
 
 # Batch writes are split into transactions of this many rows, with up to
-# WRITE_CONCURRENCY transactions in flight (see benchmarks/README.md: cost
-# grows with rows per transaction, and concurrent transactions scale ~2-3x).
+# WRITE_CONCURRENCY transactions in flight. benchmarks/README.md (Phase 4
+# sweep): per-row cost grows superlinearly with rows per transaction, 100-row
+# chunks beat 200 by ~25% at any concurrency, and 4 in flight is the knee.
 # Defaults; per-adapter values come from TYPEDB_WRITE_CHUNK_ROWS /
 # TYPEDB_WRITE_CONCURRENCY when set (read at construction).
-WRITE_CHUNK_ROWS = 200
+WRITE_CHUNK_ROWS = 100
 WRITE_CONCURRENCY = 4
 COMMIT_RETRIES = 6
 # Artifacts per serial provenance transaction (read + diff write per artifact).

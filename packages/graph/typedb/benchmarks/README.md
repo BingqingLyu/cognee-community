@@ -79,42 +79,148 @@ the ratios are what matter.
 
 ## Shipped adapter, before → after
 
+Phase 0 (2026-09-04, sequential `UUID(int=i)` test ids, which we later
+found hit a shared-prefix scan on the server, see below) and Phase 4
+(2026-09-09, random ids, serial provenance attach, 100-row chunks):
+
 | | 1,000 nodes / 1,500 edges | 5,000 nodes / 7,500 edges |
 |---|---|---|
-| `add_nodes` | 672 → **~3,800** rows/s | ~1,700 rows/s |
-| `add_edges` | 157 → **~900–1,100** rows/s | ~260 rows/s |
-| re-upsert (update path) | 561 → ~2,200 rows/s | ~740 rows/s |
-| `get_neighborhood` (10 seeds, depth 2) | 1.97 s → **0.17 s** | 24.6 s → **1.19 s** |
-| `get_edges` (one node) | 40 ms → 4 ms | 10 ms |
-| `get_graph_data` | 27k rows/s | 25k rows/s |
+| `add_nodes` (+provenance) | 672 → 3,800 → **2,250–2,400** rows/s | 1,700 → **2,850–3,200** rows/s |
+| `add_edges` (+provenance) | 157 → 1,000 → **1,250** rows/s | 260 → **2,250–2,750** rows/s |
+| re-upsert (update path) | 561 → 2,200 → **5,000–5,700** rows/s | 740 → **6,500–6,700** rows/s |
+| `get_neighborhood` (10 seeds, depth 2) | 1.97 s → 0.17 s → **0.04 s** | 24.6 s → 1.19 s → **0.07 s** |
+| `get_graph_data` | 27k → **21k** rows/s | 25k → **17k** rows/s |
 
-Ranges are across runs; the laptop server is noisy at ±20 %.
+Ranges are across runs; the laptop server is noisy at ±20 %. The 1k
+`add_nodes` figure is lower than Phase 0's because the provenance attach
+now runs as a separate serial transaction after the upserts (the folded
+form conflicted, see the STC2 observation); `bulk_insert.py`'s bare
+`chunk-N/ptx` scenarios show the upsert alone at 5,200 (1k) and 7,900 (5k)
+rows/s.
 
-These "after" numbers predate Phase 2: `add_nodes`/`add_edges` now also
-fold the provenance attach into each chunk's transaction (a read of the
-chunk's current provenance plus a diff write) whenever a `source_ref_key`
-is passed, as it is in `bulk_insert.py`'s `current` scenario. The
-`chunk-N` scenarios use the bare templates and stay comparable to the
-table; re-measure `current` before quoting it.
+## Phase 4: write-path tuning (2026-09-09)
+
+`tuning.py` at 5,000 nodes / 7,500 edges, bare upserts (no provenance),
+rows/s:
+
+| chunk rows | conc 1 | conc 2 | conc 4 | conc 8 |
+|---|---|---|---|---|
+| 100 | 6,660 / 3,305 | 9,790 / 5,479 | **9,442 / 7,617** | 7,658 / 5,946 |
+| 200 | 6,714 / 3,438 | 8,740 / 4,731 | 7,648 / 5,760 | 4,317 / 4,399 |
+| 500 | 5,228 / 2,337 | 4,681 / 2,177 | 2,252 / 1,547 | 2,516 / 1,524 |
+| 1000 | 2,419 / 980 | 1,268 / 606 | 1,007 / 471 | 8,251 / 1,440 |
+
+(nodes / edges). Per-row cost grows superlinearly with the rows in a
+transaction: 100-row chunks beat 200 by ~25 % at every concurrency and
+1,000-row chunks are 5–15× slower. Concurrency helps up to 4 and hurts at 8.
+The default moved from 200 to 100 rows per chunk; 4 in flight stays.
+
+**Driver pool: not worth it.** The same rows written through 1, 2 or 4
+adapter instances (one native driver each, 4 transactions in flight per
+instance) into one database:
+
+| drivers | nodes | edges |
+|---|---|---|
+| 1 | 8,335 rows/s | 4,971 rows/s |
+| 2 | 5,875 | 4,951 |
+| 4 | 3,846 | 4,919 |
+
+More drivers only add contention on the server; the single driver's gRPC
+thread is not the ceiling at this scale. The adapter keeps one driver.
+
+**One big transaction is the worst option.** All chunks pipelined into a
+single transaction (`bulk_insert.py`'s `chunk-N/tx`) runs at 300 rows/s
+for nodes and **34 rows/s for edges** at 5k, against 7,900 / 2,950 with one
+transaction per chunk: a transaction's per-query cost grows with the writes
+already buffered in it.
+
+## Phase 4: TypeDB vs Ladybug vs Neo4j (2026-09-09)
+
+`compare_adapters.py` runs one workload through cognee's `GraphDBInterface`
+on each backend: TypeDB 3.12.3 (this adapter, 200-row chunks, 4 in flight),
+Ladybug 0.17.1 (cognee's default, embedded in-process) and Neo4j 5.28
+community (cognee's built-in adapter, dockerized, no GDS plugin). Same
+laptop, same seeded data (random uuid4 ids, 400–900-char payloads), wall
+time per step.
+
+| step (5,000 nodes / 7,500 edges) | TypeDB | Ladybug | Neo4j |
+|---|---|---|---|
+| `add_nodes` + provenance | 1.55 s | 0.27 s | 1.14 s |
+| `add_edges` + provenance | 3.36 s | 0.72 s | 1.89 s |
+| re-upsert 5,000 nodes (second run id) | 0.77 s | 0.35 s | 0.91 s |
+| `get_graph_data` (12,500 rows) | 0.76 s | 0.05 s | 2.25 s |
+| `get_neighborhood` (10 seeds, depth 2) | 69 ms | 14 ms | 138 ms |
+| `get_edges` × 100 nodes | 172 ms | 141 ms | 252 ms |
+| `get_id_filtered_graph_data` (200 ids) | 69 ms | 16 ms | 157 ms |
+| `find_nodes_by_source_ref` + `get_node_delete_data` (500) | 157 ms | 15 ms | 704 ms |
+| `delete_nodes` (500) | 185 ms | 21 ms | 73 ms |
+| 4 concurrent `add_nodes` (5,000 total, provenance) | 1.42 s | 0.50 s | 0.54 s |
+
+| step (1,000 nodes / 1,500 edges) | TypeDB | Ladybug | Neo4j |
+|---|---|---|---|
+| `add_nodes` + provenance | 0.42 s | 0.11 s | 0.25 s |
+| `add_edges` + provenance | 1.21 s | 0.11 s | 0.61 s |
+| `get_graph_data` (2,500 rows) | 0.12 s | 0.01 s | 0.43 s |
+| `get_neighborhood` (10 seeds, depth 2) | 41 ms | 9 ms | 81 ms |
+| `delete_nodes` (500) | 163 ms | 16 ms | 60 ms |
+
+Reading it:
+
+- **Ladybug is 3–15× faster across the board.** It is an embedded engine
+  with no network hop, no transaction commit protocol and no multi-tenant
+  isolation; that is the price of a server, not of this adapter.
+- **Against Neo4j, the other server, TypeDB is 1.3–1.8× slower on bulk
+  writes and 1.5–4.5× faster on the read paths cognee hits most**:
+  `get_graph_data` (projected on every GRAPH_COMPLETION search),
+  neighborhoods, id-filtered projections and the delete planner's
+  provenance lookups.
+- **Where TypeDB loses:** `add_edges` (each edge matches both endpoints by
+  key, then `put`s a relation), `delete_nodes` (edge cascade is a separate
+  query), and concurrent `add_nodes` calls that all carry provenance: the
+  upserts run concurrently but the attach is serialized per adapter (see
+  the STC2 observation below), so four concurrent callers pay for four
+  serial attach transactions.
+- These numbers are with random ids; the Phase 0 tables above were
+  measured with sequential `UUID(int=i)` ids, which hit the shared-prefix
+  scan described below, and understate TypeDB by 5–20×.
 
 ## Server observations worth raising with the TypeDB team
 
-- `match $n isa node, has node-id == $v` (key attribute, bound value) does
-  not appear to use the key index in `given` pipelines or with literal
-  values; `put` on the same pattern does. Attribute-first phrasing is 2× faster
-  but still ~0.8 ms/row.
+- **String-value lookups degrade to a scan when the values share a prefix
+  of ~8+ characters** (found in Phase 4, 2026-09-09; this is what the
+  Phase 0 note below was really seeing). On a one-attribute `@key` entity,
+  200 lookups of `has k == $v`:
+
+  | value shape | 5,000 values | 20,000 values |
+  |---|---|---|
+  | random uuid4 (36 chars) | 53,000 lookups/s | 54,000 lookups/s |
+  | 12 random chars | 53,000 | 55,000 |
+  | 12 chars with an 8-char shared prefix | 607 | 147 |
+  | uuid with 8-char shared prefix, rest random | 228 | 59 |
+  | sequential `UUID(int=i)` | 224 | 59 |
+
+  Random values are O(1); any shared 8-char prefix is O(N) in the number of
+  values, regardless of total length. Cognee's ids are uuid5, so real
+  graphs are on the fast path; the Phase 0 benchmarks used sequential
+  `UUID(int=i)` ids and understated write and lookup throughput by 5–20×.
+  Two cognee values do share a prefix: `source_ref:v1:<dataset uuid>:…`
+  (all data of one dataset) and `source_run_ref:v1:<run uuid>:…`, so
+  `find_*_by_source_ref` scans that dataset's distinct ref keys.
+- (Phase 0, superseded by the above) `match $n isa node, has node-id == $v`
+  looked like it was not using the key index; it was the sequential test ids.
 - A negation-only `match not { … };` stage placed after `update` in a `given`
   pipeline did not filter rows that already had the attribute; the same
   negation works as a standalone statement.
 - `match $x iid $var` rejects a `given`-bound variable (syntax error), and
   `iid($x)` inside `fetch` is a syntax error on 3.12.3.
 - `[STC2]` commit conflicts between concurrent transactions whose rows own
-  the same long string value (a 600-char `properties-json` shared by every
-  row): 9–15 conflicts across 20 concurrent 50-row transactions, zero once
-  each row's payload is distinct. Identical short values (`node-type`,
-  `name`) never conflict, so this looks specific to how long strings are
-  stored (hashed key?). Adding the set-once `match … not {}; insert`
-  statement on top exhausts a 6-attempt retry budget on the same sweep.
+  the same string value **longer than 16 characters**: with a shared 16-char
+  `name` 0 conflicts across 20 concurrent 50-row transactions; 32 chars and
+  up, 9–15 (all the way to a shared 600-char `properties-json`). Distinct
+  values never conflict. This matters for cognee: every row of a provenance
+  batch owns the same `source-ref-key` (86 chars) and run/dataset ids
+  (36 chars), so the adapter attaches provenance in serial transactions
+  after the concurrent upserts rather than inside them.
 - `{ $s has $a; } or { $t has $a; }` (disjunction over the role a bound
   node plays) is 12–18× slower than two role-specific queries.
 - `typeql-check` accepts `from` as a role label; the server rejects it

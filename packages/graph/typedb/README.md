@@ -102,7 +102,7 @@ graph config has no provider-specific fields:
 |----------|---------|-------------|
 | `TYPEDB_TLS` | `false` | `true` to connect over TLS (TypeDB Cloud, hardened servers) using the system trust roots |
 | `TYPEDB_TLS_ROOT_CA` | – | With `TYPEDB_TLS=true`: path to a PEM CA bundle for servers with a private or self-signed CA |
-| `TYPEDB_WRITE_CHUNK_ROWS` | `200` | Rows per write transaction in `add_nodes` / `add_edges` (see `benchmarks/README.md` before changing) |
+| `TYPEDB_WRITE_CHUNK_ROWS` | `100` | Rows per write transaction in `add_nodes` / `add_edges` (see `benchmarks/README.md` before changing) |
 | `TYPEDB_WRITE_CONCURRENCY` | `4` | Write transactions in flight per adapter; also sizes its driver thread pool |
 
 ### Environment Variables
@@ -181,7 +181,7 @@ from the main cognee repository.
   feedback weights, node truth state, and `get_triplets_batch`
 - Async API; the synchronous TypeDB driver runs on a small dedicated thread pool
 - Batched writes: rows travel through the TypeQL `given` stage (never
-  string-interpolated) in 200-row chunks with four transactions in flight,
+  string-interpolated) in 100-row chunks with four transactions in flight,
   retried on commit conflicts
 - Raw TypeQL via `graph_engine.query()`, with `given`-based parameters
 - Compatible with Cognee's add/cognify/search and graph visualization
