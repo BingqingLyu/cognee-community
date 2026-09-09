@@ -215,3 +215,28 @@ def test_handler_rejects_half_configured_credentials():
         handler._connection_settings(config(graph_database_username="u"))
     with pytest.raises(DatabaseCredentialsError):
         handler._connection_settings(config(graph_database_password="p"))
+
+
+def test_write_knobs_from_environment(monkeypatch):
+    from cognee_community_graph_adapter_typedb.typedb_adapter import (
+        WRITE_CHUNK_ROWS,
+        WRITE_CONCURRENCY,
+        TypeDBAdapter,
+        _positive_int_env,
+    )
+
+    adapter = TypeDBAdapter()
+    assert (adapter._chunk_rows, adapter._write_concurrency) == (
+        WRITE_CHUNK_ROWS,
+        WRITE_CONCURRENCY,
+    )
+
+    monkeypatch.setenv("TYPEDB_WRITE_CHUNK_ROWS", "500")
+    monkeypatch.setenv("TYPEDB_WRITE_CONCURRENCY", "2")
+    adapter = TypeDBAdapter()
+    assert (adapter._chunk_rows, adapter._write_concurrency) == (500, 2)
+    assert adapter._get_executor()._max_workers == 3
+
+    for bad in ("0", "-1", "many"):
+        with pytest.raises(ValueError, match="TYPEDB_WRITE_CHUNK_ROWS"):
+            _positive_int_env("TYPEDB_WRITE_CHUNK_ROWS", 200, {"TYPEDB_WRITE_CHUNK_ROWS": bad})

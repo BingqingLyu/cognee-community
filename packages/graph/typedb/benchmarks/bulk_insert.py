@@ -66,7 +66,11 @@ def make_nodes(count: int, seed: int = 7) -> list[Entity]:
             "".join(rng.choices(string.ascii_lowercase, k=rng.randint(3, 9)))
             for _ in range(rng.randint(60, 140))
         )
-        nodes.append(Entity(id=uuid.UUID(int=index + 1), name=f"entity {index}", description=words))
+        # Random (but seeded) ids, like cognee's uuid5 ids. Sequential UUIDs
+        # share a long prefix, and TypeDB's string-value lookups degrade to a
+        # scan when values share their first ~8 characters (see README).
+        node_id = uuid.UUID(int=rng.getrandbits(128), version=4)
+        nodes.append(Entity(id=node_id, name=f"entity {index}", description=words))
     return nodes
 
 

@@ -11,6 +11,7 @@ Usage: uv run python benchmarks/stage_isolation.py [--rows 1000] [--address host
 import argparse
 import asyncio
 import json
+import random
 import time
 import uuid
 
@@ -51,13 +52,19 @@ insert $e isa edge, links (source: $s, target: $t), has edge-key == $key,
 EDGE_PUT_UPDATE = _EDGE_UPSERT
 
 
+def node_id(index: int) -> uuid.UUID:
+    """Deterministic but random-looking ids (sequential UUIDs share a prefix,
+    which turns TypeDB's string lookups into scans; see README)."""
+    return uuid.UUID(int=random.Random(index).getrandbits(128), version=4)
+
+
 def node_rows(count, now):
     # Per-row payloads: rows sharing one long attribute value conflict at
     # commit under concurrent writers (see README), which real data never does.
     payload = "x" * 600
     return [
         {
-            "id": str(uuid.UUID(int=i + 1)),
+            "id": str(node_id(i)),
             "type": "Entity",
             "name": f"e{i}",
             "props": json.dumps({"description": payload, "i": i}),
@@ -72,8 +79,8 @@ def edge_rows(count, node_count, now):
     rows = []
     for i in range(count):
         sid, tid = (
-            str(uuid.UUID(int=(i % node_count) + 1)),
-            str(uuid.UUID(int=((i * 7 + 3) % node_count) + 1)),
+            str(node_id(i % node_count)),
+            str(node_id((i * 7 + 3) % node_count)),
         )
         rel = ["is_a", "contains", "related_to"][i % 3]
         rows.append(

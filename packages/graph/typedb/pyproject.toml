@@ -25,6 +25,10 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+# Comparative benchmarks against cognee's built-in Neo4j adapter (benchmarks/).
+bench = [
+    "neo4j>=5.0.0,<6",
+]
 
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"
