@@ -52,13 +52,15 @@ EDGE_PUT_UPDATE = _EDGE_UPSERT
 
 
 def node_rows(count, now):
-    props = json.dumps({"description": "x" * 600})
+    # Per-row payloads: rows sharing one long attribute value conflict at
+    # commit under concurrent writers (see README), which real data never does.
+    payload = "x" * 600
     return [
         {
             "id": str(uuid.UUID(int=i + 1)),
             "type": "Entity",
             "name": f"e{i}",
-            "props": props,
+            "props": json.dumps({"description": payload, "i": i}),
             "created": now,
             "now": now,
         }
@@ -152,13 +154,11 @@ async def stages(address, n):
 async def tx_sweep(address, n, sizes, concurrency):
     now = _now_ms()
     nrows, erows = node_rows(n, now), edge_rows(int(n * 1.5), n, now)
-    node_chunks = lambda size: [
-        [
-            (PUT_UPDATE, nrows[i : i + size]),
-            (_SET_NODE_CREATED_AT, [{"id": r["id"], "now": now} for r in nrows[i : i + size]]),
-        ]
-        for i in range(0, n, size)
-    ]
+    # The shipped node shape: put + update only (the set-once created-at
+    # statement was dropped from nodes; under 4 concurrent writers its
+    # `match … not {}` read widened the conflict footprint enough to exhaust
+    # the adapter's STC2 retry budget on this sweep).
+    node_chunks = lambda size: [[(PUT_UPDATE, nrows[i : i + size])] for i in range(0, n, size)]
     edge_chunks = lambda size: [
         [
             (EDGE_PUT_UPDATE, erows[i : i + size]),

@@ -46,7 +46,12 @@ the ratios are what matter.
    with four drivers — retry storms and/or the per-driver I/O thread. Phase 4
    should test a driver pool. Concurrent commits DO conflict
    (`[STC2] isolation conflict`) even on disjoint ids, so a commit retry is
-   required.
+   required. Isolated later (2026-09-08): the conflicts come from rows that
+   share one *large* attribute value — every benchmark row carries the same
+   600-char `properties-json` — not from the ids. With per-row payloads
+   (which real cognee data always has) 5,000 nodes / 7,500 edges written by
+   four concurrent writers needed zero retries; identical short values
+   (`node-type`, `name`) never conflicted either.
 5. **An `or` over which role the anchor plays is 12–18× slower than two
    directional queries.** Sweeping 200 anchors' incident edges on a
    1,000-node graph: `{ $s has $a; } or { $t has $a; }` 6.3 s, the same with
@@ -103,8 +108,13 @@ table; re-measure `current` before quoting it.
   negation works as a standalone statement.
 - `match $x iid $var` rejects a `given`-bound variable (syntax error), and
   `iid($x)` inside `fetch` is a syntax error on 3.12.3.
-- `[STC2]` commit conflicts between concurrent transactions writing disjoint
-  node ids (likely the negation's absence-read locks).
+- `[STC2]` commit conflicts between concurrent transactions whose rows own
+  the same long string value (a 600-char `properties-json` shared by every
+  row): 9–15 conflicts across 20 concurrent 50-row transactions, zero once
+  each row's payload is distinct. Identical short values (`node-type`,
+  `name`) never conflict, so this looks specific to how long strings are
+  stored (hashed key?). Adding the set-once `match … not {}; insert`
+  statement on top exhausts a 6-attempt retry budget on the same sweep.
 - `{ $s has $a; } or { $t has $a; }` (disjunction over the role a bound
   node plays) is 12–18× slower than two role-specific queries.
 - `typeql-check` accepts `from` as a role label; the server rejects it
