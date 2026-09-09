@@ -146,3 +146,52 @@ def test_decode_provenance_prefers_ordered_json_over_set_index():
 
     keys, refs, _ = TypeDBAdapter._decode_provenance({"pj": "not json", "keys": ["a"]})
     assert (keys, refs) == (["a"], [])
+
+
+def test_tls_config_from_environment():
+    from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
+
+    assert not TypeDBAdapter._tls_config({}).is_enabled
+    assert not TypeDBAdapter._tls_config({"TYPEDB_TLS": "false"}).is_enabled
+    native = TypeDBAdapter._tls_config({"TYPEDB_TLS": "true"})
+    assert native.is_enabled and native.root_ca_path is None
+
+
+def test_tls_root_ca_must_exist(tmp_path):
+    from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
+
+    with pytest.raises(Exception, match=r"(?i)ca|tls|file|path"):
+        TypeDBAdapter._tls_config(
+            {"TYPEDB_TLS": "1", "TYPEDB_TLS_ROOT_CA": str(tmp_path / "x.pem")}
+        )
+
+
+def test_handler_rejects_half_configured_credentials():
+    from types import SimpleNamespace
+
+    from cognee.infrastructure.databases.exceptions import DatabaseCredentialsError
+
+    from cognee_community_graph_adapter_typedb import TypeDBDatasetDatabaseHandler
+
+    handler = TypeDBDatasetDatabaseHandler
+
+    def config(**overrides):
+        fields = {
+            "graph_database_url": "127.0.0.1:1729",
+            "graph_database_username": "",
+            "graph_database_password": "",
+        }
+        return SimpleNamespace(**{**fields, **overrides})
+
+    assert handler._connection_settings(config()) == ("127.0.0.1:1729", None, None)
+    assert handler._connection_settings(
+        config(graph_database_username="u", graph_database_password="p")
+    ) == (
+        "127.0.0.1:1729",
+        "u",
+        "p",
+    )
+    with pytest.raises(DatabaseCredentialsError):
+        handler._connection_settings(config(graph_database_username="u"))
+    with pytest.raises(DatabaseCredentialsError):
+        handler._connection_settings(config(graph_database_password="p"))

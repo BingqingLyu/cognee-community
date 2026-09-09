@@ -16,6 +16,12 @@ Only writes provision a database. Reads on a missing database see an empty
 graph, so an engine handle that outlives ``prune_system`` / dataset deletion
 does not recreate the dropped database (cognee's shared e2e suite calls
 ``is_empty()`` on such a handle after its final prune).
+
+Isolation is per database, not per TypeDB user: every dataset database is
+opened with the one service account in the graph config. Half-configured
+credentials (username without password or vice versa) are rejected up front
+with cognee's ``DatabaseCredentialsError``; when neither is set the adapter's
+development defaults (``admin`` / ``password``) apply.
 """
 
 import re
@@ -25,6 +31,7 @@ from uuid import UUID
 from cognee.infrastructure.databases.dataset_database_handler import (
     DatasetDatabaseHandlerInterface,
 )
+from cognee.infrastructure.databases.exceptions import DatabaseCredentialsError
 from cognee.infrastructure.databases.graph.config import get_graph_config
 from cognee.infrastructure.databases.graph.get_graph_engine import graph_engine_cache
 from cognee.modules.users.models import DatasetDatabase, User
@@ -50,11 +57,17 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
             )
 
         database_name = cls._database_name_for_dataset(dataset_id)
+        url, username, password = cls._connection_settings(graph_config)
 
         # Provision the database and define the cognee schema now, so the first
-        # pipeline write finds it ready (and so a bad address fails here, not
-        # mid-cognify).
-        adapter = cls._adapter(graph_config, database_name)
+        # pipeline write finds it ready (and so a bad address or bad
+        # credentials fail here, not mid-cognify).
+        adapter = TypeDBAdapter(
+            graph_database_url=url,
+            graph_database_username=username,
+            graph_database_password=password,
+            database_name=database_name,
+        )
         try:
             await adapter._provision_database()
         finally:
@@ -62,7 +75,7 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
 
         return {
             "graph_database_provider": "typedb",
-            "graph_database_url": graph_config.graph_database_url,
+            "graph_database_url": url,
             "graph_database_name": database_name,
             "graph_database_key": graph_config.graph_database_key,
             "graph_dataset_database_handler": TYPEDB_DATASET_DATABASE_HANDLER,
@@ -74,13 +87,13 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
         cls, dataset_database: DatasetDatabase
     ) -> DatasetDatabase:
         """Attach credentials from the live config; nothing is written back."""
-        graph_config = get_graph_config()
+        url, username, password = cls._connection_settings(get_graph_config())
         info = dict(dataset_database.graph_database_connection_info or {})
-        info.setdefault("graph_database_username", graph_config.graph_database_username)
-        info.setdefault("graph_database_password", graph_config.graph_database_password)
+        info.setdefault("graph_database_username", username)
+        info.setdefault("graph_database_password", password)
         dataset_database.graph_database_connection_info = info
         if not dataset_database.graph_database_url:
-            dataset_database.graph_database_url = graph_config.graph_database_url
+            dataset_database.graph_database_url = url
         return dataset_database
 
     @classmethod
@@ -90,15 +103,15 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
         Accepts the ``DatasetDatabase`` ORM object (dataset deletion) or the
         read-only row mapping ``prune_system`` iterates over.
         """
-        graph_config = get_graph_config()
         database_name = cls._field(dataset_database, "graph_database_name")
         # Never drop a database this handler did not create.
         cls._validate_database_name(database_name)
 
-        url = cls._field(dataset_database, "graph_database_url") or graph_config.graph_database_url
+        config_url, config_username, config_password = cls._connection_settings(get_graph_config())
+        url = cls._field(dataset_database, "graph_database_url") or config_url
         info = dict(cls._field(dataset_database, "graph_database_connection_info") or {})
-        username = info.get("graph_database_username") or graph_config.graph_database_username
-        password = info.get("graph_database_password") or graph_config.graph_database_password
+        username = info.get("graph_database_username") or config_username
+        password = info.get("graph_database_password") or config_password
 
         # Evict by database name: cognee's cache key also carries the user-scoped
         # graph_file_path and subprocess flag, which a handler cannot rebuild.
@@ -130,14 +143,28 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
         if driver.databases.contains(adapter.database_name):
             driver.databases.get(adapter.database_name).delete()
 
-    @classmethod
-    def _adapter(cls, graph_config, database_name: str) -> TypeDBAdapter:
-        return TypeDBAdapter(
-            graph_database_url=graph_config.graph_database_url,
-            graph_database_username=graph_config.graph_database_username,
-            graph_database_password=graph_config.graph_database_password,
-            database_name=database_name,
-        )
+    @staticmethod
+    def _connection_settings(graph_config) -> tuple[str, str | None, str | None]:
+        """(url, username, password) for the service account, validated.
+
+        TypeDB has no anonymous access: a username without a password (or the
+        reverse) can only be a misconfiguration, so it is rejected before any
+        database is created. Neither set means the adapter's development
+        defaults; an empty URL means its default local address.
+        """
+        username = graph_config.graph_database_username or None
+        password = graph_config.graph_database_password or None
+        if bool(username) != bool(password):
+            provided = "username" if username else "password"
+            missing = "password" if username else "username"
+            raise DatabaseCredentialsError(
+                message=(
+                    f"TypeDB credentials are incomplete: '{provided}' was provided but "
+                    f"'{missing}' is missing. Set both GRAPH_DATABASE_USERNAME and "
+                    "GRAPH_DATABASE_PASSWORD, or neither for the development defaults."
+                )
+            )
+        return graph_config.graph_database_url or None, username, password
 
     @classmethod
     def _database_name_for_dataset(cls, dataset_id: UUID | None) -> str:

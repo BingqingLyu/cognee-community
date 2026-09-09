@@ -44,6 +44,7 @@ back entirely, so a retry never duplicates work.
 
 import asyncio
 import json
+import os
 import random
 import re
 import threading
@@ -86,6 +87,11 @@ DEFAULT_ADDRESS = "127.0.0.1:1729"
 DEFAULT_USERNAME = "admin"
 DEFAULT_PASSWORD = "password"
 DEFAULT_DATABASE = "cognee"
+# TLS is off by default (local/docker servers); TypeDB Cloud and hardened
+# deployments need it. Read from the environment because cognee's graph config
+# has no provider-specific fields.
+TLS_ENV = "TYPEDB_TLS"
+TLS_ROOT_CA_ENV = "TYPEDB_TLS_ROOT_CA"
 
 # The schema is the single source of truth in schema.tql (shipped with the
 # package). The define is idempotent and re-run on every fresh adapter, so
@@ -445,16 +451,34 @@ class TypeDBAdapter(GraphDBInterface):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._get_executor(), fn, *args)
 
+    @staticmethod
+    def _tls_config(environ=os.environ):
+        """TLS settings from ``TYPEDB_TLS`` / ``TYPEDB_TLS_ROOT_CA``.
+
+        ``TYPEDB_TLS`` unset or false: plaintext. True: TLS with the system's
+        native trust roots, or with the PEM bundle at ``TYPEDB_TLS_ROOT_CA``
+        when that is set (self-signed / private CA deployments).
+        """
+        from typedb.driver import DriverTlsConfig
+
+        enabled = environ.get(TLS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+        if not enabled:
+            return DriverTlsConfig.disabled()
+        root_ca = environ.get(TLS_ROOT_CA_ENV, "").strip()
+        if root_ca:
+            return DriverTlsConfig.enabled_with_root_ca(root_ca)
+        return DriverTlsConfig.enabled_with_native_root_ca()
+
     def _get_driver(self):
         """Lazily open the (synchronous) TypeDB driver."""
         with self._state_lock:
             if self._driver is None:
-                from typedb.driver import Credentials, DriverOptions, DriverTlsConfig, TypeDB
+                from typedb.driver import Credentials, DriverOptions, TypeDB
 
                 self._driver = TypeDB.driver(
                     self.address,
                     Credentials(self.username, self.password),
-                    DriverOptions(DriverTlsConfig.disabled()),
+                    DriverOptions(self._tls_config()),
                 )
             return self._driver
 

@@ -67,6 +67,21 @@ if __name__ == "__main__":
 - `typedb-driver` (installed automatically)
 - An LLM API key for the full cognee pipeline (see the repository README)
 
+### Running TypeDB
+
+Any TypeDB 3.12+ server works: a local install, [TypeDB Cloud](https://cloud.typedb.com),
+or the bundled compose file, which starts a pinned server on host port
+`1730` (so it does not collide with a local server on `1729`) with a named
+volume for the data:
+
+```bash
+docker compose -f examples/docker/docker-compose.yml up -d --wait
+export GRAPH_DATABASE_URL=127.0.0.1:1730
+```
+
+`docker compose -f examples/docker/docker-compose.yml down -v` removes the
+server and its data.
+
 ## Configuration
 
 Configure via `set_graph_db_config()`:
@@ -79,6 +94,14 @@ Configure via `set_graph_db_config()`:
 | `graph_database_password` | `password` | TypeDB password |
 | `graph_database_name` | `cognee` | TypeDB database; created (with the cognee schema) on first write |
 | `graph_dataset_database_handler` | – | Set to `typedb` for one database per dataset (backend access control) |
+
+Two TypeDB-specific settings come from the environment, because cognee's
+graph config has no provider-specific fields:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TYPEDB_TLS` | `false` | `true` to connect over TLS (TypeDB Cloud, hardened servers) using the system trust roots |
+| `TYPEDB_TLS_ROOT_CA` | – | With `TYPEDB_TLS=true`: path to a PEM CA bundle for servers with a private or self-signed CA |
 
 ### Environment Variables
 
@@ -110,6 +133,36 @@ run pipelines against the TypeDB provider unless
 `ENABLE_BACKEND_ACCESS_CONTROL=false`. Credentials are never stored in the
 dataset registry; they are resolved from the live config when a connection is
 opened.
+
+#### Deployment modes
+
+| `ENABLE_BACKEND_ACCESS_CONTROL` | Graph layout | When to use |
+|---|---|---|
+| `true` (cognee default) | One TypeDB database per dataset, `cognee_<uuid>`; cognee's user/role/tenant permissions gate every read, write, and delete | Multi-user or multi-tenant deployments, per-dataset lifecycle (delete a dataset, drop its database) |
+| `false` | One shared database (`graph_database_name`, default `cognee`) for every dataset and user | Single-user scripts, notebooks, benchmarks |
+
+What the isolation does and does not give you:
+
+- **Isolation is per database.** Dataset databases never share nodes, so a
+  query against one dataset cannot see another's data even at the TypeQL
+  level. Cognee's permission checks decide which datasets (and so which
+  databases) a user may touch; `tests/e2e/test_permissions.py` exercises
+  this end to end.
+- **One service account.** Every dataset database is opened with the
+  credentials in the graph config, so those should belong to a dedicated
+  TypeDB user for cognee rather than a shared admin. The handler rejects a
+  username without a password (or the reverse) before it creates anything;
+  with neither set it uses the development defaults.
+- **Lifecycle.** `create_dataset` provisions the database and defines the
+  schema up front, so a wrong address or bad credentials fail at dataset
+  creation rather than mid-cognify. `delete_dataset` and `prune_system` drop
+  the database; the handler refuses to drop anything not named
+  `cognee_<uuid hex>`. Reads on a dropped database see an empty graph and
+  never recreate it.
+- **Housekeeping.** Every dataset database is visible to the server's
+  standard tooling (`typedb console`, the driver's `databases.all()`), and
+  `cognee_<uuid hex>` names map back to `dataset.id.hex` in cognee's
+  relational store.
 
 See [`.env.example`](.env.example) for a complete template (including an
 Anthropic + local-embeddings variant), or use the
@@ -194,14 +247,16 @@ run-to-key pairing (only `source-run-id` was stored then).
 ## Example
 
 See `examples/example.py` for a full workflow (add data, cognify, search,
-graph visualization) against a local TypeDB server.
+graph visualization) against a local TypeDB server, or the notebook
+`examples/typedb_cognee.ipynb` for the same walkthrough with a look at the
+resulting TypeDB database through raw TypeQL.
 
 ## Running tests
 
 ```bash
 uv run pytest tests/unit -q           # offline contract tests, no server needed
 uv run pytest tests/integration -q    # adapter against TypeDB on 127.0.0.1:1729
-RUN_E2E_TESTS=1 uv run pytest tests/e2e -q   # cognee's shared suite, both access-control modes (+ LLM key)
+RUN_E2E_TESTS=1 uv run pytest tests/e2e -q   # cognee's shared suite, graph-native delete, permissions (+ LLM key)
 ```
 
 ## License
