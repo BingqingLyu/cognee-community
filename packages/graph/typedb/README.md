@@ -103,7 +103,11 @@ graph config has no provider-specific fields:
 | `TYPEDB_TLS` | `false` | `true` to connect over TLS (TypeDB Cloud, hardened servers) using the system trust roots |
 | `TYPEDB_TLS_ROOT_CA` | – | With `TYPEDB_TLS=true`: path to a PEM CA bundle for servers with a private or self-signed CA |
 | `TYPEDB_WRITE_CHUNK_ROWS` | `100` | Rows per write transaction in `add_nodes` / `add_edges` (see `benchmarks/README.md` before changing) |
-| `TYPEDB_WRITE_CONCURRENCY` | `4` | Write transactions in flight per adapter; also sizes its driver thread pool |
+| `TYPEDB_WRITE_CONCURRENCY` | `4` | Write transactions in flight per adapter; its driver thread pool is one larger |
+
+All four are read when an adapter is constructed. Cognee caches one adapter
+per dataset, so a change takes effect for adapters created afterwards, not
+for ones already in the cache.
 
 ### Environment Variables
 
@@ -219,9 +223,11 @@ cognee's rollback and delete planners rely on. Chunks that carry provenance
 run one at a time per adapter: TypeDB conflicts concurrent inserts of
 ownership of the same string value longer than 16 characters, and every
 row of a batch owns the same source-ref key, dataset id and run id (see
-`benchmarks/README.md`; serial 100-row chunks also measured fastest).
-Explicit attach/remove calls use the same serialized path; all provenance
-writes retry on TypeDB commit conflicts.
+`benchmarks/README.md`; serial 100-row chunks are the fastest shape that
+keeps the fold). Explicit attach/remove calls use the same serialized path.
+Writers in other processes or adapter instances still conflict at commit;
+those conflicts are retried for up to 30 seconds with capped, jittered
+backoff, and a warning is logged once the contention lasts ten rounds.
 
 Feedback weights (`feedback_weight`) and truth state (`truth_alignment`,
 `truth_epoch`) live inside `properties-json`, where `CogneeGraph` reads them

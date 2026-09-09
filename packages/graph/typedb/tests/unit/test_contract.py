@@ -238,6 +238,7 @@ def test_write_knobs_from_environment(monkeypatch):
     adapter = TypeDBAdapter()
     assert (adapter._chunk_rows, adapter._write_concurrency) == (500, 2)
     assert adapter._get_executor()._max_workers == 3
+    adapter._close_sync()
 
     for bad in ("0", "-1", "many"):
         with pytest.raises(ValueError, match="TYPEDB_WRITE_CHUNK_ROWS"):

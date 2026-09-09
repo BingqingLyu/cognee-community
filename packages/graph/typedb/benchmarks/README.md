@@ -97,12 +97,13 @@ Ranges are across runs; the laptop server is noisy at ±20 %. The 1k
 run one at a time (the Phase 0 number was bare upserts with 4 in flight);
 `bulk_insert.py`'s `chunk-N/ptx` scenarios still show the bare upsert at
 5,200 (1k) and 7,900 (5k) rows/s. A two-phase variant (concurrent upserts,
-then one serial attach pass) measured ~30 % faster (5k: 1.55 s / 3.36 s vs
-2.19 s / 4.87 s) and was rejected: it leaves a window, and on a phase-2
-failure a permanent state, where artifacts exist without provenance, which
-cognee's rollback and dataset-delete planners cannot see. The remaining
-lever in the fold is round trips: each chunk's transaction issues one
-provenance read plus up to five diff writes.
+then one serial attach pass) measured ~30 % faster (5k: 1.55 s / 3.36 s at
+its then-default 200-row chunks vs 2.19 s / 4.87 s folded at 100-row
+chunks, so the gap is if anything understated) and was rejected: it leaves
+a window, and on a phase-2 failure a permanent state, where artifacts exist
+without provenance, which cognee's rollback and dataset-delete planners
+cannot see. The remaining lever in the fold is round trips: each chunk's
+transaction issues one provenance read plus up to five diff writes.
 
 ## Phase 4: write-path tuning (2026-09-09)
 
@@ -125,8 +126,8 @@ to 4 and hurts at 8. The default moved from 200 to 100 rows per chunk; 4
 in flight stays.
 
 **Driver pool: not worth it.** The same rows written through 1, 2 or 4
-adapter instances (one native driver each, 4 transactions in flight per
-instance) into one database:
+adapter instances (one native driver each, 200-row chunks, 4 transactions
+in flight per instance) into one database:
 
 | drivers | nodes | edges |
 |---|---|---|
@@ -150,7 +151,9 @@ on each backend: TypeDB 3.12.3 (this adapter as shipped: 100-row chunks,
 4 in flight, provenance folded per chunk and serialized), Ladybug 0.17.1
 (cognee's default, embedded in-process) and Neo4j 5.28 community (cognee's
 built-in adapter, dockerized, no GDS plugin). Same laptop, same seeded data
-(random uuid4 ids, 400–900-char payloads), wall time per step.
+(random uuid4 ids, 400–900-char payloads), wall time per step. The TypeDB
+column was re-measured after the fold was restored, twenty minutes after
+the Ladybug and Neo4j columns, on an otherwise idle machine.
 
 | step (5,000 nodes / 7,500 edges) | TypeDB | Ladybug | Neo4j |
 |---|---|---|---|
@@ -179,7 +182,7 @@ built-in adapter, dockerized, no GDS plugin). Same laptop, same seeded data
 Reading it (ratios from the 5k table):
 
 - **Ladybug, embedded in-process, is faster at everything except
-  `get_graph_metrics`** (TypeDB 3.4× faster there, at both sizes): 1.2×
+  `get_graph_metrics`** (TypeDB about 3.3× faster there, at both sizes): 1.2×
   on `get_edges`, 3–5× on re-upsert, neighborhoods and id-filtered
   projections, 7–8× on bulk writes, 9–16× on `get_graph_data`, deletes and
   the delete planner. That is the price of a server with commit isolation
@@ -199,9 +202,10 @@ Reading it (ratios from the 5k table):
 ## Server observations worth raising with the TypeDB team
 
 - **String-value lookups degrade to a scan when the values share a prefix
-  of ~8+ characters** (found in Phase 4, 2026-09-09; this is what the
-  Phase 0 note below was really seeing). On a one-attribute `@key` entity,
-  200 lookups of `has k == $v`:
+  of 8 or more characters** (shorter prefixes were not measured;
+  `server_probes.py prefix-scan` reproduces it; found in Phase 4,
+  2026-09-09, and it is what the Phase 0 note below was really seeing). On
+  a one-attribute `@key` entity, 200 lookups of `has k == $v`:
 
   | value shape | 5,000 values | 20,000 values |
   |---|---|---|
@@ -211,7 +215,7 @@ Reading it (ratios from the 5k table):
   | uuid with 8-char shared prefix, rest random | 228 | 59 |
   | sequential `UUID(int=i)` | 224 | 59 |
 
-  Random values are O(1); any shared 8-char prefix is O(N) in the number of
+  Random values are O(1); a shared 8-char prefix is O(N) in the number of
   values, regardless of total length. Cognee's ids are uuid5, so real
   graphs are on the fast path; the Phase 0 benchmarks used sequential
   `UUID(int=i)` ids and understated write and lookup throughput by 5–20×.
@@ -226,13 +230,16 @@ Reading it (ratios from the 5k table):
 - `match $x iid $var` rejects a `given`-bound variable (syntax error), and
   `iid($x)` inside `fetch` is a syntax error on 3.12.3.
 - `[STC2]` commit conflicts between concurrent transactions whose rows own
-  the same string value **longer than 16 characters**: with a shared 16-char
-  `name` 0 conflicts across 20 concurrent 50-row transactions; 32 chars and
-  up, 9–15 (all the way to a shared 600-char `properties-json`). Distinct
-  values never conflict. This matters for cognee: every row of a provenance
-  batch owns the same `source-ref-key` (86 chars) and run/dataset ids
-  (36 chars), so the adapter attaches provenance in serial transactions
-  after the concurrent upserts rather than inside them.
+  the same string value **above some length between 17 and 24 characters**
+  (`server_probes.py shared-value`): with a shared 16-char `name` 0
+  conflicts across 20 concurrent 50-row transactions; 24 chars and up, 9–15
+  (all the way to a shared 600-char `properties-json`). Distinct values
+  never conflict, and pre-creating the attribute instance in its own
+  transaction changes nothing. This matters for cognee: every row of a
+  provenance batch owns the same `source-ref-key` (86 chars) and run /
+  dataset ids (36 chars), so the adapter runs provenance-carrying chunks
+  one at a time per adapter, and writers in other adapter instances retry
+  against a time budget.
 - `{ $s has $a; } or { $t has $a; }` (disjunction over the role a bound
   node plays) is 12–18× slower than two role-specific queries.
 - `typeql-check` accepts `from` as a role label; the server rejects it

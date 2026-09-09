@@ -5,7 +5,6 @@ import asyncio
 import pytest
 
 from cognee_community_graph_adapter_typedb.typedb_adapter import (
-    COMMIT_RETRIES,
     WRITE_CHUNK_ROWS,
     WRITE_CONCURRENCY,
     TypeDBAdapter,
@@ -50,8 +49,9 @@ async def test_write_batch_does_not_retry_other_errors():
     assert len(calls) == 1
 
 
-async def test_write_batch_gives_up_after_commit_retries():
+async def test_write_batch_gives_up_when_the_conflict_budget_ends():
     adapter = _offline_adapter()
+    adapter._commit_retry_seconds = 0.15
     calls = []
 
     async def fake_run_sync(fn, *args):
@@ -61,7 +61,8 @@ async def test_write_batch_gives_up_after_commit_retries():
     adapter._run_sync = fake_run_sync
     with pytest.raises(RuntimeError, match="STC2"):
         await adapter._write_batch(["match $n isa node; delete $n;"])
-    assert len(calls) == COMMIT_RETRIES
+    # Time-budgeted, not count-budgeted: several rounds within 150 ms.
+    assert len(calls) >= 3
 
 
 async def test_write_rows_cancels_pending_chunks_on_first_failure():
@@ -165,3 +166,74 @@ async def test_provenance_chunk_failure_stops_the_batch():
     with pytest.raises(RuntimeError, match="chunk 2 failed"):
         await adapter._write_rows("template", rows, provenance=("node", "id", lambda k, r: None))
     assert seen == ["0", str(WRITE_CHUNK_ROWS)]
+
+
+class _RecordingTransaction:
+    """Stand-in for a driver transaction: records queries and commits."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def query(self, text, given_rows=None):
+        self.log.append(("query", text.strip().splitlines()[0], given_rows))
+        answer = []
+
+        class _Promise:
+            def resolve(self):
+                return answer
+
+        return _Promise()
+
+    def commit(self):
+        self.log.append(("commit",))
+
+
+async def test_folded_chunk_is_one_transaction():
+    """The upsert and the attach share a transaction: if the attach fails,
+    the upsert is never committed."""
+    adapter = _offline_adapter()
+    log = []
+
+    class _Driver:
+        def transaction(self, _database, _type):
+            return _RecordingTransaction(log)
+
+    adapter._get_driver = lambda: _Driver()
+    adapter._collect_answer = lambda answer: [{"id": "n1", "pj": None}]
+
+    def transition_that_fails(keys, run_refs):
+        raise RuntimeError("attach failed")
+
+    with pytest.raises(RuntimeError, match="attach failed"):
+        adapter._provenance_change_sync(
+            "node", ["n1"], transition_that_fails, pre_specs=[("put $n isa node;", [{"id": "n1"}])]
+        )
+    assert log[0] == ("query", "put $n isa node;", [{"id": "n1"}])  # upsert was issued ...
+    assert ("commit",) not in log  # ... but nothing committed
+
+
+async def test_cancelled_write_waits_for_the_in_flight_transaction():
+    """Cancelling a caller must not let a chunk commit after the caller (and
+    cognee's rollback) has moved on: the in-flight transaction finishes first."""
+    import time
+
+    adapter = _offline_adapter()
+    finished = []
+
+    def slow_transaction():
+        time.sleep(0.15)
+        finished.append("committed")
+
+    task = asyncio.create_task(adapter._run_sync_shielded(slow_transaction))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished == ["committed"]  # the cancellation waited for it
+    await adapter.close()

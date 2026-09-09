@@ -24,14 +24,18 @@ transition, write the diff, commit), so no artifact is ever visible
 without its provenance, the invariant cognee's rollback and delete
 planners rely on. Chunks that carry provenance run one at a time under the
 adapter's provenance lock: TypeDB conflicts concurrent inserts of
-ownership of the same string value longer than 16 characters
+ownership of the same string value longer than 16 to 24 characters
 (benchmarks/README.md), every row of a batch owns the same source-ref key,
 dataset id and run id, and pre-creating the attribute does not help, so
 concurrent provenance chunks only retried each other. Serial 100-row
-chunks are in fact the fastest shape measured. Concurrent changes to one
-artifact from different callers still conflict at commit (``[STC2]``,
-verified in ``tests/integration/test_concurrency.py``) and are retried
-against a re-read of the record.
+chunks are the fastest shape that keeps the per-chunk fold (a two-phase
+upsert-then-attach measured ~30 % faster and was rejected for the window
+it opens). Writers in other adapter instances or processes still conflict
+at commit (``[STC2]``, verified in ``tests/integration/test_concurrency.py``
+and ``test_stress.py``); conflicts are retried against a re-read of the
+record within a time budget rather than a fixed count, because the loser
+of a sustained contest loses every round until the other writer's batch
+ends.
 
 A node's ``created-at`` mirrors its DataPoint payload's ``created_at``; an
 edge's is set once on first write; ``updated-at`` is the write time (all
@@ -53,6 +57,7 @@ back entirely, so a retry never duplicates work.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import random
@@ -269,7 +274,14 @@ select $id;
 # TYPEDB_WRITE_CONCURRENCY when set (read at construction).
 WRITE_CHUNK_ROWS = 100
 WRITE_CONCURRENCY = 4
-COMMIT_RETRIES = 6
+# Commit conflicts ([STC2]) are retried for this long with capped, fully
+# jittered backoff. A count would not do: under sustained contention from
+# another writer on the same database (another process, or a second cached
+# adapter for the same dataset) the loser keeps losing until the other
+# batch ends, which can take longer than any short fixed budget.
+COMMIT_RETRY_SECONDS = 30.0
+COMMIT_BACKOFF_CAP_SECONDS = 0.25
+COMMIT_RETRY_WARN_AFTER = 10
 WRITE_CHUNK_ROWS_ENV = "TYPEDB_WRITE_CHUNK_ROWS"
 WRITE_CONCURRENCY_ENV = "TYPEDB_WRITE_CONCURRENCY"
 
@@ -454,6 +466,7 @@ class TypeDBAdapter(GraphDBInterface):
         self._lock = asyncio.Lock()
         self._chunk_rows = _positive_int_env(WRITE_CHUNK_ROWS_ENV, WRITE_CHUNK_ROWS)
         self._write_concurrency = _positive_int_env(WRITE_CONCURRENCY_ENV, WRITE_CONCURRENCY)
+        self._commit_retry_seconds = COMMIT_RETRY_SECONDS
         # Caps in-flight chunk transactions across ALL concurrent batch calls.
         self._write_semaphore = asyncio.Semaphore(self._write_concurrency)
         # Serializes every provenance write within this adapter: folded
@@ -664,7 +677,50 @@ class TypeDBAdapter(GraphDBInterface):
 
     @staticmethod
     async def _backoff(attempt: int) -> None:
-        await asyncio.sleep(0.02 * (2**attempt) * (0.5 + random.random()))
+        # Full jitter, exponential up to the cap: two losers never lock-step.
+        await asyncio.sleep(random.random() * min(COMMIT_BACKOFF_CAP_SECONDS, 0.02 * 2**attempt))
+
+    async def _retry_commit_conflicts(self, attempt, retry: bool = True):
+        """Run ``attempt()`` until it succeeds or the conflict budget ends.
+
+        Only [STC2] commit conflicts are retried (the failed commit rolled the
+        whole transaction back, so replaying never duplicates work); any
+        other error propagates at once. After COMMIT_RETRY_WARN_AFTER
+        rounds a warning names the contention.
+        """
+        deadline = time.monotonic() + self._commit_retry_seconds
+        rounds = 0
+        while True:
+            try:
+                return await attempt()
+            except Exception as error:
+                if not retry or not self._is_commit_conflict(error):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                rounds += 1
+                if rounds == COMMIT_RETRY_WARN_AFTER:
+                    logger.warning(
+                        "TypeDB commit conflicts on %s: %d retries so far, another writer "
+                        "is active on this database (budget %.0fs)",
+                        self.database_name,
+                        rounds,
+                        self._commit_retry_seconds,
+                    )
+                await self._backoff(rounds)
+
+    async def _run_sync_shielded(self, fn, *args):
+        """``_run_sync`` for write transactions: a cancelled caller waits for
+        the in-flight transaction to finish (commit or fail) before the
+        cancellation propagates, so no chunk can commit after cognee's
+        rollback has already looked."""
+        task = asyncio.ensure_future(self._run_sync(fn, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(task)
+            raise
 
     async def _write_batch(self, queries, retry: bool = True) -> None:
         """Run write queries in one WRITE transaction; results are discarded.
@@ -679,15 +735,11 @@ class TypeDBAdapter(GraphDBInterface):
 
         await self._provision_database()
         specs = self._as_specs(queries)
-        attempts = COMMIT_RETRIES if retry else 1
-        for attempt in range(attempts):
-            try:
-                await self._run_sync(self._run_batch_sync, specs, TransactionType.WRITE, False)
-                return
-            except Exception as error:
-                if attempt + 1 == attempts or not self._is_commit_conflict(error):
-                    raise
-                await self._backoff(attempt)
+
+        async def attempt():
+            await self._run_sync_shielded(self._run_batch_sync, specs, TransactionType.WRITE, False)
+
+        await self._retry_commit_conflicts(attempt, retry)
 
     async def _write_rows(
         self,
@@ -706,9 +758,10 @@ class TypeDBAdapter(GraphDBInterface):
         provenance to the rows it upserted (atomic per chunk), and the
         chunks run one at a time under the provenance lock (module
         docstring). Either way the batch is not atomic: on the first failure,
-        chunks not yet started are cancelled, chunks already committed stay
-        committed, and chunks mid-transaction run to completion before the
-        error propagates.
+        chunks not yet started are cancelled and chunks already committed
+        stay committed. A chunk whose transaction is in flight when the
+        batch fails or the caller is cancelled runs to its end first (commit
+        or roll back), so the caller never observes a chunk still landing.
         """
         if not rows:
             return
@@ -744,22 +797,19 @@ class TypeDBAdapter(GraphDBInterface):
         """One chunk transaction, retried on commit conflicts. With
         ``provenance`` = (kind, identities, transition) the transaction also
         applies the provenance transition to those artifacts after the specs."""
-        for attempt in range(COMMIT_RETRIES):
-            try:
-                # The slot is held only for the attempt, never during backoff.
-                async with self._write_semaphore:
-                    if provenance is None:
-                        await self._write_batch(specs, retry=False)
-                    else:
-                        kind, identities, transition = provenance
-                        await self._run_sync(
-                            self._provenance_change_sync, kind, identities, transition, specs
-                        )
-                return
-            except Exception as error:
-                if attempt + 1 == COMMIT_RETRIES or not self._is_commit_conflict(error):
-                    raise
-                await self._backoff(attempt)
+
+        async def attempt():
+            # The slot is held only for the attempt, never during backoff.
+            async with self._write_semaphore:
+                if provenance is None:
+                    await self._write_batch(specs, retry=False)
+                else:
+                    kind, identities, transition = provenance
+                    await self._run_sync_shielded(
+                        self._provenance_change_sync, kind, identities, transition, specs
+                    )
+
+        await self._retry_commit_conflicts(attempt)
 
     # ------------------------------------------------------------------
     # Read-modify-write primitives (one transaction each, retried on STC2)
@@ -901,14 +951,9 @@ class TypeDBAdapter(GraphDBInterface):
         if not identities:
             return set()
         await self._provision_database()
-        for attempt in range(COMMIT_RETRIES):
-            try:
-                return await self._run_sync(self._mutate_properties_sync, kind, identities, mutate)
-            except Exception as error:
-                if attempt + 1 == COMMIT_RETRIES or not self._is_commit_conflict(error):
-                    raise
-                await self._backoff(attempt)
-        return set()
+        return await self._retry_commit_conflicts(
+            lambda: self._run_sync_shielded(self._mutate_properties_sync, kind, identities, mutate)
+        )
 
     @classmethod
     def _concept_to_value(cls, concept) -> Any:
@@ -1041,14 +1086,11 @@ class TypeDBAdapter(GraphDBInterface):
         else:
             await self._provision_database()
         specs = [(query, given_rows)]
-        attempts = 1 if resolved == TransactionType.READ else COMMIT_RETRIES
-        for attempt in range(attempts):
-            try:
-                return (await self._run_sync(self._run_batch_sync, specs, resolved, True))[0]
-            except Exception as error:
-                if attempt + 1 == attempts or not self._is_commit_conflict(error):
-                    raise
-                await self._backoff(attempt)
+
+        async def attempt():
+            return (await self._run_sync(self._run_batch_sync, specs, resolved, True))[0]
+
+        return await self._retry_commit_conflicts(attempt, resolved != TransactionType.READ)
 
     async def has_node(self, node_id: str) -> bool:
         results = await self._read_batch([(_FETCH_NODES, [{"id": str(node_id)}])])
