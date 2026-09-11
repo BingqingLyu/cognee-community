@@ -1,111 +1,57 @@
-# Write-path benchmarks (Phase 0)
+# Benchmarks
 
-Scripts: `bulk_insert.py` (end-to-end adapter throughput by batching strategy),
-`stage_isolation.py` (which pipeline stage costs what; transaction-size sweep).
-Both need a TypeDB 3.12+ server and create/drop their own databases.
+Scripts, all against a TypeDB 3.12+ server (they create and drop their own
+`cognee_bench_*` databases):
 
-Measured 2026-09-04 against a local TypeDB 3.12 on an Apple M2 laptop
-(single-node server, driver 3.12.3). Absolute numbers are machine-specific;
-the ratios are what matter.
-
-## Headline results (1,000 nodes / 1,500 edges, ~600-char payloads)
-
-| Write path | rows/s |
+| script | measures |
 |---|---|
-| nodes: plain `insert`, one tx | 18,400 |
-| nodes: `put` identity + `update` mirrors, one tx | 18,000 |
-| nodes: + set-once `created-at` (`match … not {…}; insert`) | **826** |
-| edges: `match` both endpoints by key + `insert`, one tx | 275–299 |
-| edges: just matching both endpoints (read-only!) | 284 |
-| edges: attribute-first endpoint lookup + `insert`, one tx | 594 |
-| edges: attribute-first, 100-row txs, 4 concurrent (+retry) | **1,767** |
-| read: `get_graph_data` | 27,000 |
-| read: `get_neighborhood` (10 seeds, depth 2) | 2 s total |
+| `compare_adapters.py` | one `GraphDBInterface` workload on TypeDB, Ladybug and Neo4j |
+| `tuning.py` | chunk size × concurrency sweep; driver-instance sweep |
+| `bulk_insert.py` | `add_nodes` / `add_edges` by batching strategy, plus the read side |
+| `stage_isolation.py` | which pipeline stage costs what; transaction-size sweep |
+| `server_probes.py` | reproduces the two server observations at the bottom |
+
+Measured 2026-09-09 against a local TypeDB 3.12.3 (driver 3.12.3) on an
+Apple M2 laptop. Absolute numbers are machine-specific and noisy at ±20 %;
+the ratios are what matter.
 
 ## What determines throughput
 
-1. **Rows per transaction, not rows per query.** Splitting a batch into 250-row
-   `given` queries inside one transaction changed nothing; committing every
-   250 rows did (+30 % nodes, +120 % edges). One query per row was only ~20 %
-   slower than one query per batch. `given` batching is worth keeping, but it
-   is not the lever.
-2. **Node cost is the set-once `created-at` statement.** `put`+`update` runs at
-   18k rows/s; the `match … not { $n has created-at $c }; insert` statement
-   alone drops the pipeline to 826. The negation is the cost (an
-   attribute-first lookup did not help: 664 rows/s).
-3. **Edge cost is the endpoint key lookup.** Matching two nodes by
-   `has node-id == $var` costs ~1.7 ms per lookup and grows with graph size
-   (0.4 ms at 100 nodes, 1.7 ms at 1,000) — a scan-like profile, while `put`
-   on the identical pattern runs at 37k rows/s, so the key index exists and
-   `put` uses it. Phrasing the lookup attribute-first
-   (`$a isa node-id == $id; $n isa node, has $a;`) halves the cost.
-4. **Concurrent transactions scale ~2–3×.** With 4 writers × 250 rows one
-   shared driver matched one driver per writer (1,771 vs 1,713 rows/s); with
-   4 writers × 1,250 rows (16 chunked transactions in flight through one
-   driver + one 4-thread pool) the shared driver fell to 379 rows/s vs 1,632
-   with four drivers — retry storms and/or the per-driver I/O thread. Phase 4
-   should test a driver pool. Concurrent commits DO conflict
-   (`[STC2] isolation conflict`) even on disjoint ids, so a commit retry is
-   required. Isolated later (2026-09-08): the conflicts come from rows that
-   share one *large* attribute value — every benchmark row carries the same
-   600-char `properties-json` — not from the ids. With per-row payloads
-   (which real cognee data always has) 5,000 nodes / 7,500 edges written by
-   four concurrent writers needed zero retries; identical short values
-   (`node-type`, `name`) never conflicted either.
+1. **Rows per transaction.** Per-row cost grows superlinearly with the rows
+   in a transaction (tuning table below): 100-row chunks are the knee, and
+   pipelining every chunk into one transaction is the worst option by far
+   (34 edges/s at 5k). Rows per *query* barely matters: `given` batching is
+   worth keeping for round trips, but it is not the lever.
+2. **Concurrent transactions help up to 4 in flight** and hurt at 8, and
+   more native drivers only add contention: one driver per adapter.
+3. **Provenance costs a serial pass.** Every row of a provenance batch owns
+   the same source-ref key, dataset id and run id, and TypeDB conflicts
+   concurrent inserts of ownership of the same long string value, so the
+   fold runs one chunk at a time. That is the gap between the bare upsert
+   (7,900 nodes/s at 5k) and `add_nodes` with provenance (2,300).
+4. **The set-once `created-at` negation was the node-write cost** (826
+   rows/s against 18,000 without it), so nodes mirror the payload's
+   `created_at` instead; edges keep the set-once statement.
 5. **An `or` over which role the anchor plays is 12–18× slower than two
-   directional queries.** Sweeping 200 anchors' incident edges on a
-   1,000-node graph: `{ $s has $a; } or { $t has $a; }` 6.3 s, the same with
-   inline key matches 4.1 s, two role-specific queries merged client-side
-   0.34 s. This was the whole cost of `get_neighborhood` / `get_edges`.
-6. **Everything lookup-bound degrades with graph size** (point 3): from
-   1,000 to 5,000 nodes, edge writes fall 1,101 → 256 rows/s and node writes
-   1,935 → 842. Batching cannot fix this; it is the server-side finding to
-   raise.
+   directional queries**; incident-edge sweeps always run as two queries.
+6. **Key lookups are O(1) only for values without a shared prefix** (the
+   first server observation below). With cognee's random ids the direct
+   `has node-id == $id` form and the attribute-first form perform the same,
+   so templates use the direct form.
 
 ## Decisions applied to the adapter
 
-- Attribute-first key lookups in every template (node-id and edge-key).
-- Incident-edge sweeps run as two directional queries (never an `or` over
-  the anchor's role).
 - `add_nodes` / `add_edges` chunk rows into transactions of
-  `WRITE_CHUNK_ROWS` (200) and run up to `WRITE_CONCURRENCY` (4) transactions
-  concurrently, retrying `STC2` commit conflicts with backoff. A batch no
-  longer commits atomically (neither do the sibling adapters' batches).
-- Node `created-at` mirrors the DataPoint payload's own `created_at` (the
-  same "mirror the JSON" rule as node-type/name), written in the `update`
-  stage; the set-once negation statement — which capped node writes at
-  ~800–1,900 rows/s — is gone from the node path. Edges keep set-once
-  semantics (their payload carries no timestamp).
+  `TYPEDB_WRITE_CHUNK_ROWS` (100) with up to `TYPEDB_WRITE_CONCURRENCY` (4)
+  in flight; provenance-carrying chunks fold the attach into their
+  transaction and run serially; commit conflicts retry against a time
+  budget. A batch does not commit atomically (nor do the sibling adapters').
+- Incident-edge sweeps run as two directional queries.
+- Node `created-at` mirrors the DataPoint payload's own `created_at`,
+  written in the `update` stage; edges keep set-once semantics.
+- One native driver per adapter.
 
-## Shipped adapter, before → after
-
-Phase 0 (2026-09-04, sequential `UUID(int=i)` test ids, which we later
-found hit a shared-prefix scan on the server, see below) and Phase 4
-(2026-09-09, random ids, 100-row chunks, provenance folded into each chunk
-with provenance chunks run serially):
-
-| | 1,000 nodes / 1,500 edges | 5,000 nodes / 7,500 edges |
-|---|---|---|
-| `add_nodes` (+provenance) | 672 → 3,800 → **1,350** rows/s | 1,700 → **2,300** rows/s |
-| `add_edges` (+provenance) | 157 → 1,000 → **1,170** rows/s | 260 → **1,540** rows/s |
-| re-upsert (update path) | 561 → 2,200 → **4,300** rows/s | 740 → **4,300** rows/s |
-| `get_neighborhood` (10 seeds, depth 2) | 1.97 s → 0.17 s → **0.04 s** | 24.6 s → 1.19 s → **0.07 s** |
-| `get_graph_data` | 27k → **21k** rows/s | 25k → **18k** rows/s |
-
-Ranges are across runs; the laptop server is noisy at ±20 %. The 1k
-`add_nodes` figure is below Phase 0's 3,800 because provenance chunks now
-run one at a time (the Phase 0 number was bare upserts with 4 in flight);
-`bulk_insert.py`'s `chunk-N/ptx` scenarios still show the bare upsert at
-5,200 (1k) and 7,900 (5k) rows/s. A two-phase variant (concurrent upserts,
-then one serial attach pass) measured ~30 % faster (5k: 1.55 s / 3.36 s at
-its then-default 200-row chunks vs 2.19 s / 4.87 s folded at 100-row
-chunks, so the gap is if anything understated) and was rejected: it leaves
-a window, and on a phase-2 failure a permanent state, where artifacts exist
-without provenance, which cognee's rollback and dataset-delete planners
-cannot see. The remaining lever in the fold is round trips: each chunk's
-transaction issues one provenance read plus up to five diff writes.
-
-## Phase 4: write-path tuning (2026-09-09)
+## Write-path tuning
 
 `tuning.py` at 5,000 nodes / 7,500 edges, bare upserts (no provenance),
 rows/s:
@@ -144,7 +90,7 @@ for nodes and **34 rows/s for edges** at 5k, against 7,900 / 2,950 with one
 transaction per chunk: a transaction's per-query cost grows with the writes
 already buffered in it.
 
-## Phase 4: TypeDB vs Ladybug vs Neo4j (2026-09-09)
+## TypeDB vs Ladybug vs Neo4j
 
 `compare_adapters.py` runs one workload through cognee's `GraphDBInterface`
 on each backend: TypeDB 3.12.3 (this adapter as shipped: 100-row chunks,
@@ -195,16 +141,14 @@ Reading it (ratios from the 5k table):
   neighborhoods 2.1×, id-filtered projections 2.5×, the delete planner's
   provenance lookups 3.0×, `get_edges` 1.5×. `delete_nodes` is 2.7× slower
   (the edge cascade is a separate query).
-- Both comparisons are with random ids; the Phase 0 tables above were
-  measured with sequential `UUID(int=i)` ids, which hit the shared-prefix
-  scan described below, and understate TypeDB by 5–20×.
+- Both comparisons use random ids; see the shared-prefix observation below
+  for why that matters.
 
 ## Server observations worth raising with the TypeDB team
 
 - **String-value lookups degrade to a scan when the values share a prefix
   of 8 or more characters** (shorter prefixes were not measured;
-  `server_probes.py prefix-scan` reproduces it; found in Phase 4,
-  2026-09-09, and it is what the Phase 0 note below was really seeing). On
+  `server_probes.py prefix-scan` reproduces it; found 2026-09-09). On
   a one-attribute `@key` entity, 200 lookups of `has k == $v`:
 
   | value shape | 5,000 values | 20,000 values |
@@ -217,13 +161,12 @@ Reading it (ratios from the 5k table):
 
   Random values are O(1); a shared 8-char prefix is O(N) in the number of
   values, regardless of total length. Cognee's ids are uuid5, so real
-  graphs are on the fast path; the Phase 0 benchmarks used sequential
-  `UUID(int=i)` ids and understated write and lookup throughput by 5–20×.
+  graphs are on the fast path; the first round of these benchmarks used
+  sequential `UUID(int=i)` ids and understated write and lookup throughput
+  by 5–20× (see History).
   Two cognee values do share a prefix: `source_ref:v1:<dataset uuid>:…`
   (all data of one dataset) and `source_run_ref:v1:<run uuid>:…`, so
   `find_*_by_source_ref` scans that dataset's distinct ref keys.
-- (Phase 0, superseded by the above) `match $n isa node, has node-id == $v`
-  looked like it was not using the key index; it was the sequential test ids.
 - A negation-only `match not { … };` stage placed after `update` in a `given`
   pipeline did not filter rows that already had the attribute; the same
   negation works as a standalone statement.
@@ -244,3 +187,11 @@ Reading it (ratios from the 5k table):
   node plays) is 12–18× slower than two role-specific queries.
 - `typeql-check` accepts `from` as a role label; the server rejects it
   (`[SYR16]` reserved keyword).
+
+## History
+
+The first round (2026-09-04) measured with sequential `UUID(int=i)` ids and
+one shared 600-char payload, both of which hit server behaviours described
+above (shared-prefix scans, shared-value commit conflicts). Its tables and
+the before/after comparison were removed once re-measured; they remain in
+git history (`git log -- benchmarks/README.md`, up to commit 550699f).

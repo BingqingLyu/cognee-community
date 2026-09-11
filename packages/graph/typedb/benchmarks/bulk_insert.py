@@ -114,7 +114,7 @@ def node_specs(adapter: TypeDBAdapter, nodes, chunk: int | None):
     now = _now_ms()
     rows = []
     for node in nodes:
-        row = adapter._node_row(node)
+        row = adapter._node_upsert_row(node)
         row["now"] = now
         rows.append(row)
     template = _NODE_UPSERT

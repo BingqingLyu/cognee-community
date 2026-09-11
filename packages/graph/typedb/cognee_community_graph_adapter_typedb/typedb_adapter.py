@@ -111,7 +111,7 @@ TLS_ROOT_CA_ENV = "TYPEDB_TLS_ROOT_CA"
 # The schema is the single source of truth in schema.tql (shipped with the
 # package). The define is idempotent and re-run on every fresh adapter, so
 # additive schema evolution reaches existing databases; incompatible changes
-# (e.g. new @key constraints) require a fresh database.
+# require a fresh database.
 COGNEE_SCHEMA = (Path(__file__).parent / "schema.tql").read_text(encoding="utf-8")
 
 _SCHEMA_KEYWORDS = ("define", "undefine", "redefine")
@@ -140,8 +140,8 @@ _EDGE_UPSERT = """
 given $key: string, $sid: string, $tid: string, $rel: string, $eoid: string, $props: string,
   $now: integer;
 match
-  $sa isa node-id == $sid; $s isa node, has $sa;
-  $ta isa node-id == $tid; $t isa node, has $ta;
+  $s isa node, has node-id == $sid;
+  $t isa node, has node-id == $tid;
 put
   $e isa edge, links (source: $s, target: $t),
     has edge-key == $key, has relationship-name == $rel;
@@ -153,7 +153,7 @@ update
 
 _SET_EDGE_CREATED_AT = """
 given $key: string, $now: integer;
-match $k isa edge-key == $key; $e isa edge, has $k; not { $e has created-at $c; };
+match $e isa edge, has edge-key == $key; not { $e has created-at $c; };
 insert $e has created-at == $now;
 """
 
@@ -169,25 +169,25 @@ def _edge_key(source_id: str, target_id: str, relationship_name: str) -> str:
 
 _FETCH_NODES = """
 given $id: string;
-match $a isa node-id == $id; $n isa node, has $a;
+match $n isa node, has node-id == $id;
 fetch { "node": { $n.* } };
 """
 
 _HAS_EDGES = """
 given $key: string, $sid: string, $tid: string, $rel: string;
-match $k isa edge-key == $key; $e isa edge, has $k;
+match $e isa edge, has edge-key == $key;
 fetch { "source": $sid, "target": $tid, "relationship_name": $rel };
 """
 
 _DELETE_INCIDENT_EDGES = """
 given $id: string;
-match $a isa node-id == $id; $n isa node, has $a; $e isa edge, links ($n);
+match $n isa node, has node-id == $id; $e isa edge, links ($n);
 delete $e;
 """
 
 _DELETE_NODES = """
 given $id: string;
-match $a isa node-id == $id; $n isa node, has $a;
+match $n isa node, has node-id == $id;
 delete $n;
 """
 
@@ -201,7 +201,7 @@ delete $n;
 _INCIDENT_EDGES_OUT = """
 given $id: string;
 match
-  $a isa node-id == $id; $n isa node, has $a;
+  $n isa node, has node-id == $id;
   $e isa edge, links (source: $n, target: $m);
   $m has node-id $mid;
   $e has relationship-name $rel;
@@ -214,7 +214,7 @@ fetch {
 _INCIDENT_EDGES_IN = """
 given $id: string;
 match
-  $a isa node-id == $id; $n isa node, has $a;
+  $n isa node, has node-id == $id;
   $e isa edge, links (source: $m, target: $n);
   $m has node-id $mid;
   $e has relationship-name $rel;
@@ -228,7 +228,7 @@ fetch {
 _NEIGHBOURS = """
 given $id: string{label_decl};
 match
-  $a isa node-id == $id; $n isa node, has $a;
+  $n isa node, has node-id == $id;
   $e isa edge, links ({anchor_role}: $n, {neighbour_role}: $m){label_constraint};
   $e has relationship-name $rel;
 fetch {{ "neighbour": {{ $m.* }}, "relationship_name": $rel, "node": {{ $n.* }} }};
@@ -237,7 +237,7 @@ fetch {{ "neighbour": {{ $m.* }}, "relationship_name": $rel, "node": {{ $n.* }} 
 _REMOVE_LABELED_EDGES = """
 given $id: string, $label: string;
 match
-  $a isa node-id == $id; $n isa node, has $a;
+  $n isa node, has node-id == $id;
   $e isa edge, links ({anchor_role}: $n), has relationship-name == $label;
 delete $e;
 """
@@ -286,7 +286,7 @@ WRITE_CHUNK_ROWS_ENV = "TYPEDB_WRITE_CHUNK_ROWS"
 WRITE_CONCURRENCY_ENV = "TYPEDB_WRITE_CONCURRENCY"
 
 
-def _positive_int_env(name: str, default: int, environ=os.environ) -> int:
+def _get_env_variable_as_positive_int(name: str, default: int, environ=os.environ) -> int:
     raw = environ.get(name, "").strip()
     if not raw:
         return default
@@ -303,8 +303,8 @@ def _positive_int_env(name: str, default: int, environ=os.environ) -> int:
 
 # Artifact match fragments: bind $x (node or edge) from a given $id.
 _MATCH_BY_ID = {
-    "node": "$a isa node-id == $id; $x isa node, has $a;",
-    "edge": "$k isa edge-key == $id; $x isa edge, has $k;",
+    "node": "$x isa node, has node-id == $id;",
+    "edge": "$x isa edge, has edge-key == $id;",
 }
 # ProvenanceColumns field -> indexed set attribute.
 _PROVENANCE_ATTRS = {
@@ -368,14 +368,14 @@ def _properties_read_query(kind: str, all_artifacts: bool) -> str:
 
 _NODE_DELETE_DATA = """
 given $id: string;
-match $a isa node-id == $id; $n isa node, has $a;
+match $n isa node, has node-id == $id;
 fetch { "node": { $n.* }, "pj": $n.provenance-json,
         "keys": [ $n.source-ref-key ], "runrefs": [ $n.source-run-ref ] };
 """
 _EDGE_DELETE_DATA = """
 given $id: string;
 match
-  $k isa edge-key == $id; $e isa edge, has $k, links (source: $s, target: $t);
+  $e isa edge, has edge-key == $id, links (source: $s, target: $t);
   $s has node-id $sid; $t has node-id $tid; $e has relationship-name $rel;
 fetch { "source": $sid, "target": $tid, "relationship_name": $rel, "edge": { $e.* },
         "pj": $e.provenance-json,
@@ -383,7 +383,7 @@ fetch { "source": $sid, "target": $tid, "relationship_name": $rel, "edge": { $e.
 """
 _DELETE_EDGES_BY_KEY = """
 given $id: string;
-match $k isa edge-key == $id; $e isa edge, has $k;
+match $e isa edge, has edge-key == $id;
 delete $e;
 """
 _NODES_BY_ATTR = """
@@ -464,8 +464,10 @@ class TypeDBAdapter(GraphDBInterface):
         self._database_exists = False
         self._schema_initialized = False
         self._lock = asyncio.Lock()
-        self._chunk_rows = _positive_int_env(WRITE_CHUNK_ROWS_ENV, WRITE_CHUNK_ROWS)
-        self._write_concurrency = _positive_int_env(WRITE_CONCURRENCY_ENV, WRITE_CONCURRENCY)
+        self._chunk_rows = _get_env_variable_as_positive_int(WRITE_CHUNK_ROWS_ENV, WRITE_CHUNK_ROWS)
+        self._write_concurrency = _get_env_variable_as_positive_int(
+            WRITE_CONCURRENCY_ENV, WRITE_CONCURRENCY
+        )
         self._commit_retry_seconds = COMMIT_RETRY_SECONDS
         # Caps in-flight chunk transactions across ALL concurrent batch calls.
         self._write_semaphore = asyncio.Semaphore(self._write_concurrency)
@@ -497,7 +499,7 @@ class TypeDBAdapter(GraphDBInterface):
         return await loop.run_in_executor(self._get_executor(), fn, *args)
 
     @staticmethod
-    def _tls_config(environ=os.environ):
+    def _tls_config_from_env(environ=os.environ):
         """TLS settings from ``TYPEDB_TLS`` / ``TYPEDB_TLS_ROOT_CA``.
 
         ``TYPEDB_TLS`` unset or false: plaintext. True: TLS with the system's
@@ -528,11 +530,11 @@ class TypeDBAdapter(GraphDBInterface):
                 self._driver = TypeDB.driver(
                     self.address,
                     Credentials(self.username, self.password),
-                    DriverOptions(self._tls_config()),
+                    DriverOptions(self._tls_config_from_env()),
                 )
             return self._driver
 
-    def _detach_sync(self):
+    def _detach_driver_and_executor(self):
         """Take ownership of the current executor and driver (if any) and reset
         the adapter to its unopened state, atomically. A call that arrives
         afterwards opens a fresh pair instead of racing the closing one."""
@@ -545,7 +547,7 @@ class TypeDBAdapter(GraphDBInterface):
         return executor, driver
 
     def _close_sync(self) -> None:
-        executor, driver = self._detach_sync()
+        executor, driver = self._detach_driver_and_executor()
         if executor is not None:
             executor.shutdown(wait=True)
         if driver is not None:
@@ -560,7 +562,7 @@ class TypeDBAdapter(GraphDBInterface):
         a live connection. The adapter reopens lazily if used again.
         """
         async with self._lock:
-            executor, driver = self._detach_sync()
+            executor, driver = self._detach_driver_and_executor()
             if executor is not None:
                 await asyncio.to_thread(executor.shutdown, True)
             if driver is not None:
@@ -653,7 +655,7 @@ class TypeDBAdapter(GraphDBInterface):
         return results
 
     @staticmethod
-    def _as_specs(queries) -> list[tuple[str, list | None]]:
+    def _normalize_query_specs(queries) -> list[tuple[str, list | None]]:
         return [(query, None) if isinstance(query, str) else query for query in queries]
 
     async def _read_batch(self, queries) -> list[list[dict]]:
@@ -667,7 +669,7 @@ class TypeDBAdapter(GraphDBInterface):
         if not await self._database_available():
             return [[] for _ in queries]
         return await self._run_sync(
-            self._run_batch_sync, self._as_specs(queries), TransactionType.READ, True
+            self._run_batch_sync, self._normalize_query_specs(queries), TransactionType.READ, True
         )
 
     @staticmethod
@@ -734,7 +736,7 @@ class TypeDBAdapter(GraphDBInterface):
         from typedb.driver import TransactionType
 
         await self._provision_database()
-        specs = self._as_specs(queries)
+        specs = self._normalize_query_specs(queries)
 
         async def attempt():
             await self._run_sync_shielded(self._run_batch_sync, specs, TransactionType.WRITE, False)
@@ -1013,7 +1015,7 @@ class TypeDBAdapter(GraphDBInterface):
         return {}
 
     @staticmethod
-    def _row_from_properties(
+    def _node_upsert_row_from_properties(
         node_id: str, properties: dict[str, Any], fallback_type: str
     ) -> dict[str, Any]:
         """The shared given-row shape for a node upsert (no provenance keys)."""
@@ -1031,10 +1033,12 @@ class TypeDBAdapter(GraphDBInterface):
             ),
         }
 
-    def _node_row(self, node: DataPoint) -> dict[str, Any]:
-        return self._row_from_properties(str(node.id), node.model_dump(), type(node).__name__)
+    def _node_upsert_row(self, node: DataPoint) -> dict[str, Any]:
+        return self._node_upsert_row_from_properties(
+            str(node.id), node.model_dump(), type(node).__name__
+        )
 
-    def _neighbours_spec(self, node_id: str, incoming: bool, edge_label: str | None = None):
+    def _neighbour_query_spec(self, node_id: str, incoming: bool, edge_label: str | None = None):
         anchor_role, neighbour_role = ("target", "source") if incoming else ("source", "target")
         query = _NEIGHBOURS.format(
             label_decl=", $label: string" if edge_label is not None else "",
@@ -1103,16 +1107,16 @@ class TypeDBAdapter(GraphDBInterface):
         stamps on the node are left untouched.
         """
         if isinstance(node, DataPoint):
-            row = self._node_row(node)
+            row = self._node_upsert_row(node)
         else:
             node_props = dict(properties or {})
             node_props.setdefault("id", str(node))
-            row = self._row_from_properties(str(node), node_props, "node")
+            row = self._node_upsert_row_from_properties(str(node), node_props, "node")
         row["now"] = _now_ms()
         await self._write_batch([(_NODE_UPSERT, [row])])
 
     @staticmethod
-    def _run_id(pipeline_run_id) -> str | None:
+    def _validated_pipeline_run_id(pipeline_run_id) -> str | None:
         """Validate a pipeline run id (UUID or its string form) before any
         server contact; cognee's transition would otherwise fail mid-transaction."""
         if pipeline_run_id is None:
@@ -1123,7 +1127,7 @@ class TypeDBAdapter(GraphDBInterface):
             raise ValueError(f"pipeline_run_id must be a UUID, got {pipeline_run_id!r}") from error
 
     @classmethod
-    def _fold_transition(cls, source_ref_key: str | None, pipeline_run_id):
+    def _attach_transition_for_batch(cls, source_ref_key: str | None, pipeline_run_id):
         """The provenance transition folded into add_nodes/add_edges, or None.
 
         Delegates to cognee's ``provenance_after_attach`` (Model A: a key's run
@@ -1137,7 +1141,7 @@ class TypeDBAdapter(GraphDBInterface):
             raise ValueError(
                 "source_ref_key must be built with cognee's make_source_ref_key()"
             ) from error
-        run = cls._run_id(pipeline_run_id)
+        run = cls._validated_pipeline_run_id(pipeline_run_id)
         return lambda keys, run_refs: provenance_after_attach(keys, run_refs, [source_ref_key], run)
 
     async def add_nodes(
@@ -1154,11 +1158,11 @@ class TypeDBAdapter(GraphDBInterface):
         """
         if not nodes:
             return
-        transition = self._fold_transition(source_ref_key, pipeline_run_id)
+        transition = self._attach_transition_for_batch(source_ref_key, pipeline_run_id)
         now = _now_ms()
         rows: dict[str, dict[str, Any]] = {}
         for node in nodes:
-            row = self._node_row(node)
+            row = self._node_upsert_row(node)
             row["now"] = now
             rows[row["id"]] = row
         await self._write_rows(
@@ -1238,7 +1242,7 @@ class TypeDBAdapter(GraphDBInterface):
         """
         if not edges:
             return
-        transition = self._fold_transition(source_ref_key, pipeline_run_id)
+        transition = self._attach_transition_for_batch(source_ref_key, pipeline_run_id)
         now = _now_ms()
         rows: dict[str, dict[str, Any]] = {}
         for source_id, target_id, relationship_name, properties in edges:
@@ -1283,7 +1287,7 @@ class TypeDBAdapter(GraphDBInterface):
         """
         anchor = str(node_id)
         seen: dict[tuple[str, str, str], None] = {}
-        for document in await self._sweep_incident([anchor]):
+        for document in await self._incident_edge_documents([anchor]):
             other = document["target"] if document["source"] == anchor else document["source"]
             seen[(anchor, other, document["relationship_name"])] = None
         return [
@@ -1292,11 +1296,11 @@ class TypeDBAdapter(GraphDBInterface):
         ]
 
     async def get_predecessors(self, node_id: str, edge_label: str | None = None) -> list:
-        results = await self._read_batch([self._neighbours_spec(node_id, True, edge_label)])
+        results = await self._read_batch([self._neighbour_query_spec(node_id, True, edge_label)])
         return [self._document_to_node_dict(doc["neighbour"]) for doc in results[0]]
 
     async def get_successors(self, node_id: str, edge_label: str | None = None) -> list:
-        results = await self._read_batch([self._neighbours_spec(node_id, False, edge_label)])
+        results = await self._read_batch([self._neighbour_query_spec(node_id, False, edge_label)])
         return [self._document_to_node_dict(doc["neighbour"]) for doc in results[0]]
 
     async def get_neighbors(self, node_id: str) -> list[dict[str, Any]]:
@@ -1305,8 +1309,8 @@ class TypeDBAdapter(GraphDBInterface):
         anchor = str(node_id)
         results = await self._read_batch(
             [
-                self._neighbours_spec(anchor, True),
-                self._neighbours_spec(anchor, False),
+                self._neighbour_query_spec(anchor, True),
+                self._neighbour_query_spec(anchor, False),
             ]
         )
         neighbours = [self._document_to_node_dict(doc["neighbour"]) for doc in results[0]]
@@ -1318,7 +1322,7 @@ class TypeDBAdapter(GraphDBInterface):
         )
         return neighbours
 
-    async def _sweep_incident(self, node_ids) -> list[dict[str, Any]]:
+    async def _incident_edge_documents(self, node_ids) -> list[dict[str, Any]]:
         """All edge documents incident to the given node ids (both directions)."""
         ids = sorted(set(node_ids))
         if not ids:
@@ -1330,7 +1334,7 @@ class TypeDBAdapter(GraphDBInterface):
         return outgoing + incoming
 
     @classmethod
-    def _in_set_edges(
+    def _edges_within_node_set(
         cls, edge_docs, selected, wanted_types: set[str] | None = None
     ) -> list[tuple[str, str, str, dict]]:
         """Deduped (source, target, rel, props) with both endpoints in ``selected``."""
@@ -1358,7 +1362,7 @@ class TypeDBAdapter(GraphDBInterface):
         return node_docs, outgoing + incoming
 
     @classmethod
-    def _absorb_far_endpoints(
+    def _add_unknown_endpoints(
         cls, edge_docs, nodes: dict[str, dict], wanted_types: set[str] | None = None
     ) -> set[str]:
         """Add the not-yet-known endpoints of ``edge_docs`` to ``nodes``.
@@ -1402,19 +1406,22 @@ class TypeDBAdapter(GraphDBInterface):
         }
         swept = set(nodes)
         frontier = (
-            self._absorb_far_endpoints(edge_docs, nodes, wanted_types) if depth > 0 else set()
+            self._add_unknown_endpoints(edge_docs, nodes, wanted_types) if depth > 0 else set()
         )
         for _ in range(1, max(depth, 0)):
             if not frontier:
                 break
-            documents = await self._sweep_incident(frontier)
+            documents = await self._incident_edge_documents(frontier)
             swept |= frontier
             edge_docs.extend(documents)
-            frontier = self._absorb_far_endpoints(documents, nodes, wanted_types)
+            frontier = self._add_unknown_endpoints(documents, nodes, wanted_types)
 
         # Edges between nodes of the final frontier were never swept.
-        edge_docs.extend(await self._sweep_incident(set(nodes) - swept))
-        return (list(nodes.items()), self._in_set_edges(edge_docs, set(nodes), wanted_types))
+        edge_docs.extend(await self._incident_edge_documents(set(nodes) - swept))
+        return (
+            list(nodes.items()),
+            self._edges_within_node_set(edge_docs, set(nodes), wanted_types),
+        )
 
     async def get_node(self, node_id: str) -> dict[str, Any] | None:
         nodes = await self.get_nodes([node_id])
@@ -1431,8 +1438,8 @@ class TypeDBAdapter(GraphDBInterface):
         """(source_node, {relationship_name}, target_node) triples for a node."""
         results = await self._read_batch(
             [
-                self._neighbours_spec(str(node_id), True),
-                self._neighbours_spec(str(node_id), False),
+                self._neighbour_query_spec(str(node_id), True),
+                self._neighbour_query_spec(str(node_id), False),
             ]
         )
         connections = []
@@ -1555,9 +1562,9 @@ class TypeDBAdapter(GraphDBInterface):
         }
         if not nodes:
             return ([], [])
-        self._absorb_far_endpoints(edge_docs, nodes)
+        self._add_unknown_endpoints(edge_docs, nodes)
         # Every swept edge touches a target, and both endpoints are now known.
-        return (list(nodes.items()), self._in_set_edges(edge_docs, set(nodes)))
+        return (list(nodes.items()), self._edges_within_node_set(edge_docs, set(nodes)))
 
     async def get_nodeset_subgraph(
         self,
@@ -1587,7 +1594,7 @@ class TypeDBAdapter(GraphDBInterface):
         if not seeds:
             return ([], [])
 
-        seed_edge_docs = await self._sweep_incident(seeds)
+        seed_edge_docs = await self._incident_edge_documents(seeds)
 
         neighbour_seeds: dict[str, set[str]] = {}
         neighbour_docs: dict[str, dict] = {}
@@ -1614,8 +1621,8 @@ class TypeDBAdapter(GraphDBInterface):
 
         # Seed-incident edges are already swept; only the neighbours' own
         # edges (e.g. neighbour-to-neighbour) still need one sweep.
-        edge_docs = seed_edge_docs + await self._sweep_incident(wanted)
-        return (list(nodes.items()), self._in_set_edges(edge_docs, set(nodes)))
+        edge_docs = seed_edge_docs + await self._incident_edge_documents(wanted)
+        return (list(nodes.items()), self._edges_within_node_set(edge_docs, set(nodes)))
 
     async def get_filtered_graph_data(self, attribute_filters):
         """Nodes matching the attribute filters, and edges between them.
@@ -1635,8 +1642,11 @@ class TypeDBAdapter(GraphDBInterface):
 
         if promoted:
             nodes_by_id = await self._filtered_nodes_server_side(filters)
-            edge_docs = await self._sweep_incident(nodes_by_id)
-            return (list(nodes_by_id.items()), self._in_set_edges(edge_docs, set(nodes_by_id)))
+            edge_docs = await self._incident_edge_documents(nodes_by_id)
+            return (
+                list(nodes_by_id.items()),
+                self._edges_within_node_set(edge_docs, set(nodes_by_id)),
+            )
 
         all_nodes, all_edges = await self.get_graph_data()
         # Membership on lists compares by equality, so unhashable property
@@ -1767,7 +1777,7 @@ class TypeDBAdapter(GraphDBInterface):
     async def attach_node_source_refs(self, node_ids, source_ref_keys, pipeline_run_id=None):
         if not source_ref_keys:
             return
-        add_keys, run = list(source_ref_keys), self._run_id(pipeline_run_id)
+        add_keys, run = list(source_ref_keys), self._validated_pipeline_run_id(pipeline_run_id)
         await self._provenance_change(
             "node",
             node_ids,
@@ -1777,7 +1787,7 @@ class TypeDBAdapter(GraphDBInterface):
     async def attach_edge_source_refs(self, edges, source_ref_keys, pipeline_run_id=None):
         if not source_ref_keys:
             return
-        add_keys, run = list(source_ref_keys), self._run_id(pipeline_run_id)
+        add_keys, run = list(source_ref_keys), self._validated_pipeline_run_id(pipeline_run_id)
         await self._provenance_change(
             "edge",
             [self._edge_identity_key(edge) for edge in edges],
@@ -1809,7 +1819,7 @@ class TypeDBAdapter(GraphDBInterface):
         rows = [{"id": self._edge_identity_key(edge)} for edge in edges]
         await self._write_batch([(_DELETE_EDGES_BY_KEY, rows)])
 
-    def _snapshot_columns(self, document: dict) -> ProvenanceColumns:
+    def _provenance_columns_from_document(self, document: dict) -> ProvenanceColumns:
         keys, run_refs, _stored = self._decode_provenance(document)
         return ProvenanceColumns(keys, derive_dataset_ids(keys), derive_run_ids(run_refs), run_refs)
 
@@ -1827,7 +1837,7 @@ class TypeDBAdapter(GraphDBInterface):
             indexed_fields = (
                 list(metadata.get("index_fields") or []) if isinstance(metadata, dict) else []
             )
-            columns = self._snapshot_columns(document)
+            columns = self._provenance_columns_from_document(document)
             result[node_id] = NodeDeleteData(
                 node_id=node_id,
                 node_type=str(properties.get("type") or node_doc.get("node-type") or ""),
@@ -1855,7 +1865,7 @@ class TypeDBAdapter(GraphDBInterface):
                 document["source"], document["target"], document["relationship_name"]
             )
             properties = self._document_to_edge_properties(document["edge"])
-            columns = self._snapshot_columns(document)
+            columns = self._provenance_columns_from_document(document)
             result[edge] = EdgeDeleteData(
                 edge=edge,
                 edge_text=get_edge_retrieval_text(
@@ -1968,11 +1978,11 @@ class TypeDBAdapter(GraphDBInterface):
     # CogneeGraph reads feedback_weight from the projected properties) ---
 
     @staticmethod
-    def _valid_ids(ids) -> list[str]:
+    def _non_empty_string_ids(ids) -> list[str]:
         return [identity for identity in ids if isinstance(identity, str) and identity]
 
     async def get_node_feedback_weights(self, node_ids) -> dict[str, float]:
-        valid = self._valid_ids(node_ids)
+        valid = self._non_empty_string_ids(node_ids)
         if not valid:
             return {}
         result = {}
@@ -1986,7 +1996,7 @@ class TypeDBAdapter(GraphDBInterface):
     async def set_node_feedback_weights(self, node_feedback_weights) -> dict[str, bool]:
         if not node_feedback_weights:
             return {}
-        valid = self._valid_ids(node_feedback_weights)
+        valid = self._non_empty_string_ids(node_feedback_weights)
         updated = set()
         if valid:
             updated = await self._mutate_properties(
@@ -2000,7 +2010,7 @@ class TypeDBAdapter(GraphDBInterface):
         return {node_id: node_id in updated for node_id in node_feedback_weights}
 
     async def get_node_truth_state(self, node_ids) -> dict[str, dict[str, Any]]:
-        valid = self._valid_ids(node_ids)
+        valid = self._non_empty_string_ids(node_ids)
         if not valid:
             return {}
         result = {}
@@ -2020,7 +2030,7 @@ class TypeDBAdapter(GraphDBInterface):
     async def set_node_truth_state(self, node_truth_state) -> dict[str, bool]:
         if not node_truth_state:
             return {}
-        valid = self._valid_ids(node_truth_state)
+        valid = self._non_empty_string_ids(node_truth_state)
 
         def mutate(node_id, props):
             state = node_truth_state[node_id]
@@ -2037,7 +2047,7 @@ class TypeDBAdapter(GraphDBInterface):
         return (await self._read_batch([(_EDGES_BY_OBJECT_ID, rows)]))[0]
 
     async def get_edge_feedback_weights(self, edge_object_ids) -> dict[str, float]:
-        valid = self._valid_ids(edge_object_ids)
+        valid = self._non_empty_string_ids(edge_object_ids)
         if not valid:
             return {}
         result = {}
@@ -2052,7 +2062,7 @@ class TypeDBAdapter(GraphDBInterface):
     async def set_edge_feedback_weights(self, edge_feedback_weights) -> dict[str, bool]:
         if not edge_feedback_weights:
             return {}
-        valid = self._valid_ids(edge_feedback_weights)
+        valid = self._non_empty_string_ids(edge_feedback_weights)
         found = (
             {doc["key"]: doc["eoid"] for doc in await self._edges_by_object_ids(valid)}
             if valid

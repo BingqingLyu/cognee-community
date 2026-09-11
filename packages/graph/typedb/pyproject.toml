@@ -25,6 +25,12 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+# The Anthropic + local-embeddings setup in .env.example (examples, e2e tier).
+llm = [
+    "anthropic>=0.40",
+    "fastembed>=0.4",
+    "onnxruntime>=1.17",
+]
 # Comparative benchmarks against cognee's built-in Neo4j adapter (benchmarks/).
 bench = [
     "neo4j>=5.28.0,<6",  # cognee 1.4.2's own neo4j extra pins the same floor

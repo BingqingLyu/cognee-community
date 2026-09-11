@@ -113,13 +113,13 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
         Accepts the ``DatasetDatabase`` ORM object (dataset deletion) or the
         read-only row mapping ``prune_system`` iterates over.
         """
-        database_name = cls._field(dataset_database, "graph_database_name")
+        database_name = cls._row_field(dataset_database, "graph_database_name")
         # Never drop a database this handler did not create.
         cls._validate_database_name(database_name)
 
         config_url, config_username, config_password = cls._connection_settings(get_graph_config())
-        url = cls._field(dataset_database, "graph_database_url") or config_url
-        info = dict(cls._field(dataset_database, "graph_database_connection_info") or {})
+        url = cls._row_field(dataset_database, "graph_database_url") or config_url
+        info = dict(cls._row_field(dataset_database, "graph_database_connection_info") or {})
         username = info.get("graph_database_username") or config_username
         password = info.get("graph_database_password") or config_password
 
@@ -141,7 +141,7 @@ class TypeDBDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _field(row, name: str):
+    def _row_field(row, name: str):
         """Read a column from an ORM object or a dict-like row mapping."""
         if isinstance(row, Mapping):
             return row.get(name)

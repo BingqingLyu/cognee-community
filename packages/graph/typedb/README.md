@@ -16,6 +16,10 @@ uv sync --all-extras
 poetry install
 ```
 
+Extras: `dev` (pytest), `llm` (the Anthropic + local fastembed embeddings
+setup in `.env.example`), `bench` (the Neo4j driver for
+`benchmarks/compare_adapters.py`).
+
 ## Usage
 
 ```python

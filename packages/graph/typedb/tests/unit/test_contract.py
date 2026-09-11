@@ -103,9 +103,14 @@ def test_created_at_mirror_rejects_bool_and_non_int_payload_values():
     from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
 
     for value in (True, "2026-01-01", None, 1.5):
-        created = TypeDBAdapter._row_from_properties("n", {"created_at": value}, "T")["created"]
+        created = TypeDBAdapter._node_upsert_row_from_properties("n", {"created_at": value}, "T")[
+            "created"
+        ]
         assert isinstance(created, int) and not isinstance(created, bool)
-    assert TypeDBAdapter._row_from_properties("n", {"created_at": 42}, "T")["created"] == 42
+    assert (
+        TypeDBAdapter._node_upsert_row_from_properties("n", {"created_at": 42}, "T")["created"]
+        == 42
+    )
 
 
 def test_cypher_and_temporal_search_types_are_gated():
@@ -133,14 +138,14 @@ async def test_provenance_fold_validates_source_ref_key_offline():
 
     from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
 
-    assert TypeDBAdapter._fold_transition(None, "run") is None
+    assert TypeDBAdapter._attach_transition_for_batch(None, "run") is None
     with pytest.raises(ValueError):
-        TypeDBAdapter._fold_transition("ds:test", str(uuid4()))
+        TypeDBAdapter._attach_transition_for_batch("ds:test", str(uuid4()))
     with pytest.raises(ValueError):
-        TypeDBAdapter._fold_transition(make_source_ref_key(uuid4(), uuid4()), "run-1")
+        TypeDBAdapter._attach_transition_for_batch(make_source_ref_key(uuid4(), uuid4()), "run-1")
 
     key, run = make_source_ref_key(uuid4(), uuid4()), str(uuid4())
-    transition = TypeDBAdapter._fold_transition(key, run)
+    transition = TypeDBAdapter._attach_transition_for_batch(key, run)
     assert transition([], []) == provenance_after_attach([], [], [key], run)
 
 
@@ -160,9 +165,9 @@ def test_decode_provenance_prefers_ordered_json_over_set_index():
 def test_tls_config_from_environment():
     from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
 
-    assert not TypeDBAdapter._tls_config({}).is_enabled
-    assert not TypeDBAdapter._tls_config({"TYPEDB_TLS": "false"}).is_enabled
-    native = TypeDBAdapter._tls_config({"TYPEDB_TLS": "true"})
+    assert not TypeDBAdapter._tls_config_from_env({}).is_enabled
+    assert not TypeDBAdapter._tls_config_from_env({"TYPEDB_TLS": "false"}).is_enabled
+    native = TypeDBAdapter._tls_config_from_env({"TYPEDB_TLS": "true"})
     assert native.is_enabled and native.root_ca_path is None
 
 
@@ -172,7 +177,7 @@ def test_tls_root_ca_must_exist(tmp_path):
     from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
 
     with pytest.raises(TypeDBDriverExceptionNative, match="No such file"):
-        TypeDBAdapter._tls_config(
+        TypeDBAdapter._tls_config_from_env(
             {"TYPEDB_TLS": "1", "TYPEDB_TLS_ROOT_CA": str(tmp_path / "x.pem")}
         )
 
@@ -182,7 +187,7 @@ def test_tls_flag_rejects_non_boolean_values():
 
     for value in ("enabled", "ture", "t"):
         with pytest.raises(ValueError, match="TYPEDB_TLS"):
-            TypeDBAdapter._tls_config({"TYPEDB_TLS": value})
+            TypeDBAdapter._tls_config_from_env({"TYPEDB_TLS": value})
 
 
 def test_handler_rejects_half_configured_credentials():
@@ -222,7 +227,7 @@ def test_write_knobs_from_environment(monkeypatch):
         WRITE_CHUNK_ROWS,
         WRITE_CONCURRENCY,
         TypeDBAdapter,
-        _positive_int_env,
+        _get_env_variable_as_positive_int,
     )
 
     for name in ("TYPEDB_WRITE_CHUNK_ROWS", "TYPEDB_WRITE_CONCURRENCY"):
@@ -242,4 +247,6 @@ def test_write_knobs_from_environment(monkeypatch):
 
     for bad in ("0", "-1", "many"):
         with pytest.raises(ValueError, match="TYPEDB_WRITE_CHUNK_ROWS"):
-            _positive_int_env("TYPEDB_WRITE_CHUNK_ROWS", 200, {"TYPEDB_WRITE_CHUNK_ROWS": bad})
+            _get_env_variable_as_positive_int(
+                "TYPEDB_WRITE_CHUNK_ROWS", 200, {"TYPEDB_WRITE_CHUNK_ROWS": bad}
+            )
