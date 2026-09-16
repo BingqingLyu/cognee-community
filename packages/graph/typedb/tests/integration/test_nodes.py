@@ -3,7 +3,11 @@
 from uuid import UUID, uuid4
 
 import pytest
-from cognee.infrastructure.databases.provenance import make_source_ref_key, make_source_run_ref
+from cognee.infrastructure.databases.provenance import (
+    EdgeIdentity,
+    make_source_ref_key,
+    make_source_run_ref,
+)
 from support import Concept
 
 
@@ -139,3 +143,48 @@ async def test_delete_node_cascades_to_edges(seeded):
     assert not await adapter.has_edge(seeded.dl, seeded.ml, "is_subset_of")
     assert await adapter.has_node(seeded.dl)  # neighbours survive
     assert await adapter.has_edge(seeded.dl, seeded.ai, "related_to")
+
+
+async def _link_count(adapter) -> int:
+    rows = await adapter.query(
+        "match $l isa sourced-from; reduce $c = count;",
+    )
+    return rows[0]["c"]
+
+
+async def test_delete_nodes_cascades_links_for_connected_sets_and_self_loops(seeded):
+    """The delete planner passes connected sets; a self-loop and a duplicated
+    id must not trip the cascade, and every provenance link of a deleted
+    node or edge goes with it."""
+    adapter = seeded.adapter
+    await adapter.add_edge(seeded.dl, seeded.dl, "self_loop")
+    await adapter.attach_edge_source_refs(
+        [EdgeIdentity(seeded.dl, seeded.dl, "self_loop")], [seeded.key], seeded.run
+    )
+    before = await _link_count(adapter)
+    assert before == 3 + 3 + 1  # three nodes, three seeded edges, the self-loop
+
+    await adapter.delete_nodes([seeded.dl, seeded.ml, seeded.dl])  # connected pair, dup id
+
+    assert not await adapter.has_node(seeded.dl) and not await adapter.has_node(seeded.ml)
+    assert await adapter.has_node(seeded.ai)
+    assert await _link_count(adapter) == 1  # only ai's own link remains
+    assert await adapter.find_nodes_by_source_ref(seeded.key) == [seeded.ai]
+
+
+async def test_delete_paths_remove_provenance_links(seeded):
+    adapter = seeded.adapter
+    assert await _link_count(adapter) == 6
+
+    await adapter.delete_edge_triples([EdgeIdentity(seeded.ml, seeded.ai, "is_subset_of")])
+    assert await _link_count(adapter) == 5
+
+    await adapter.remove_connection_to_successors_of([seeded.dl], "related_to")
+    assert await _link_count(adapter) == 4
+
+    await adapter.delete_graph()
+    assert await _link_count(adapter) == 0
+    assert await adapter.find_nodes_by_source_ref(seeded.key) == []
+    # Ref entities survive an emptied graph; the next attach re-uses them.
+    refs = await adapter.query("match $r isa source-ref; reduce $c = count;")
+    assert refs[0]["c"] == 1

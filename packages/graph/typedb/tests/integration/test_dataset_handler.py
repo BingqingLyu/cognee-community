@@ -134,3 +134,32 @@ async def test_concurrent_provisioning_of_one_database_is_idempotent(typedb_conf
         for adapter in adapters:
             await adapter.close()
         await drop_database(name)
+
+
+async def test_provisioning_refuses_a_database_from_the_attribute_provenance_era(typedb_config):
+    """A database whose nodes still own provenance-json was written by an
+    earlier version; the additive define would succeed and every artifact
+    would read as unowned, so provisioning refuses it instead."""
+    from typedb.driver import TransactionType
+
+    name = f"cognee_test_{uuid.uuid4().hex[:12]}"
+    adapter = TypeDBAdapter(graph_database_url=ADDRESS, database_name=name)
+    try:
+        await adapter._provision_database()
+        driver = adapter._get_driver()
+        with driver.transaction(name, TransactionType.SCHEMA) as tx:
+            tx.query(
+                "define attribute provenance-json value string; entity node owns provenance-json;"
+            ).resolve()
+            tx.commit()
+        await adapter.close()
+
+        stale = TypeDBAdapter(graph_database_url=ADDRESS, database_name=name)
+        with pytest.raises(RuntimeError, match="earlier version"):
+            await stale.add_nodes([Concept(name="new data")])
+        await stale.close()
+    finally:
+        await adapter.close()
+        from support import drop_database
+
+        await drop_database(name)

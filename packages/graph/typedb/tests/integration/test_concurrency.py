@@ -3,8 +3,8 @@ so the retried transaction sees the other writer's result.
 
 These cover the mainstream cognee path the contract tests do not: entity nodes
 have deterministic ids, data items are processed concurrently, so two folded
-attaches with different source refs routinely land on the same pre-existing
-node. Two adapter instances bypass the per-adapter provenance lock.
+attaches with different (or the same) source refs routinely land on the same
+pre-existing node. Two adapter instances stand in for two workers.
 """
 
 import asyncio
@@ -96,3 +96,45 @@ async def test_concurrent_property_mutations_all_land(adapter, second):
         assert stored["feedback_weight"] == 0.9
         assert stored["truth_epoch"] == 2
         assert stored["belongs_to_set"] == ["Keep"]
+
+
+async def test_concurrent_attach_of_the_same_key_links_it_once(adapter, second):
+    """Two instances attaching the SAME key to one node at once: the ref
+    entity is put by both, the loser of the artifact conflict re-reads, and
+    the key ends up linked exactly once with one run ref (Model A)."""
+    for trial in range(TRIALS):
+        node = Concept(name=f"shared-{trial}")
+        node_id = str(node.id)
+        await adapter.add_nodes([node])
+        key, run_a, run_b = make_source_ref_key(uuid4(), uuid4()), uuid4(), uuid4()
+
+        await asyncio.gather(
+            adapter.add_nodes([node], source_ref_key=key, pipeline_run_id=str(run_a)),
+            second.attach_node_source_refs([node_id], [key], str(run_b)),
+        )
+
+        snap = (await adapter.get_node_delete_data([node_id]))[node_id]
+        assert snap.source_ref_keys == [key]
+        assert len(snap.source_run_refs) == 1  # only the run that attached it first
+        assert [k for k, _ in await _ref_links(adapter, node_id)] == [key]
+
+
+async def test_delete_racing_an_attach_leaves_no_dangling_links(adapter, second):
+    """Deleting a node on one instance while another attaches to it: either
+    order is fine, but no link may survive without its node."""
+    for trial in range(TRIALS):
+        node = Concept(name=f"doomed-{trial}")
+        node_id = str(node.id)
+        await adapter.add_nodes([node])
+        key = make_source_ref_key(uuid4(), uuid4())
+
+        await asyncio.gather(
+            adapter.delete_nodes([node_id]),
+            second.attach_node_source_refs([node_id], [key], str(uuid4())),
+        )
+
+        assert not await adapter.has_node(node_id)
+        dangling = await adapter.query(
+            "match $l isa sourced-from; not { $l links (artifact: $x); }; select $l;"
+        )
+        assert dangling == []
