@@ -148,7 +148,7 @@ opened.
 | `ENABLE_BACKEND_ACCESS_CONTROL` | Graph layout | When to use |
 |---|---|---|
 | `true` (cognee default) | One TypeDB database per dataset, `cognee_<uuid>`; cognee's user/role/tenant permissions gate every read, write, and delete | Multi-user or multi-tenant deployments, per-dataset lifecycle (delete a dataset, drop its database) |
-| `false` | One shared database (`graph_database_name`, default `cognee`) for every dataset and user; `prune_system` empties it but keeps the database | Single-user scripts and notebooks |
+| `false` | One shared database (`graph_database_name`, default `cognee`) for every dataset and user; `prune_system` empties it but keeps the database | Single-user scripts |
 
 What the isolation does and does not give you:
 
@@ -191,7 +191,7 @@ from the main cognee repository.
   string-interpolated) in 100-row chunks with four transactions in flight,
   retried on commit conflicts
 - Raw TypeQL via `graph_engine.query()`, with `given`-based parameters
-- Compatible with Cognee's add/cognify/search and graph visualization
+- Compatible with Cognee's add/cognify/search
 
 ### How the graph is modeled
 
@@ -265,9 +265,8 @@ database: the relational provenance model does not read the old attributes.
 ## Example
 
 See `examples/example.py` for a full workflow (add data, cognify, search,
-graph visualization) against a local TypeDB server, or the notebook
-`examples/typedb_cognee.ipynb` for the same walkthrough with a look at the
-resulting TypeDB database through raw TypeQL.
+then a look at the resulting TypeDB database through raw TypeQL) against a
+local TypeDB server.
 
 ## Running tests
 

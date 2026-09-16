@@ -65,10 +65,30 @@ async def main():
     for index, result in enumerate(search_results, 1):
         print(f"{index}. {result}")
 
-    print("\nVisualizing the graph...")
-    # The dataset is required when backend access control (the default) is on.
-    await cognee.visualize_graph(system_path / "graph.html", dataset="typedb_knowledge")
-    print(f"Graph visualization saved to {system_path / 'graph.html'}")
+    # A look at what landed in TypeDB: the dataset's graph lives in its own
+    # database, and raw TypeQL goes through the adapter's query() with values
+    # passed as a `given` row.
+    from cognee.context_global_variables import set_database_global_context_variables
+    from cognee.infrastructure.databases.graph import get_graph_engine
+    from cognee.modules.data.methods import get_datasets_by_name
+    from cognee.modules.users.methods import get_default_user
+
+    user = await get_default_user()
+    dataset = (await get_datasets_by_name(["typedb_knowledge"], user.id))[0]
+    async with set_database_global_context_variables(dataset.id, dataset.owner_id):
+        graph = await get_graph_engine()
+    print(f"\nTypeDB database: {graph.database_name}")
+    for row in await graph.query(
+        "match $n isa node, has node-type $t; reduce $count = count groupby $t;"
+    ):
+        print(f"  {row['t']:>20}  {row['count']} nodes")
+    entities = await graph.query(
+        "given $type: string;\n"
+        "match $n isa node, has node-type == $type, has name $name;\n"
+        "select $name; sort $name; limit 5;",
+        {"type": "Entity"},
+    )
+    print("  first entities:", ", ".join(row["name"] for row in entities))
 
 
 if __name__ == "__main__":
