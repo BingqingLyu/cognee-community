@@ -17,8 +17,7 @@ poetry install
 ```
 
 Extras: `dev` (pytest), `llm` (the Anthropic + local fastembed embeddings
-setup in `.env.example`), `bench` (the Neo4j driver for
-`benchmarks/compare_adapters.py`).
+setup in `.env.example`).
 
 ## Usage
 
@@ -106,7 +105,7 @@ graph config has no provider-specific fields:
 |----------|---------|-------------|
 | `TYPEDB_TLS` | `false` | `true` to connect over TLS (TypeDB Cloud, hardened servers) using the system trust roots |
 | `TYPEDB_TLS_ROOT_CA` | – | With `TYPEDB_TLS=true`: path to a PEM CA bundle for servers with a private or self-signed CA |
-| `TYPEDB_WRITE_CHUNK_ROWS` | `100` | Rows per write transaction in `add_nodes` / `add_edges` (see `benchmarks/README.md` before changing) |
+| `TYPEDB_WRITE_CHUNK_ROWS` | `100` | Rows per write transaction in `add_nodes` / `add_edges` |
 | `TYPEDB_WRITE_CONCURRENCY` | `4` | Write transactions in flight per adapter; its driver thread pool is one larger |
 
 All four are read when an adapter is constructed. Cognee caches one adapter
@@ -149,7 +148,7 @@ opened.
 | `ENABLE_BACKEND_ACCESS_CONTROL` | Graph layout | When to use |
 |---|---|---|
 | `true` (cognee default) | One TypeDB database per dataset, `cognee_<uuid>`; cognee's user/role/tenant permissions gate every read, write, and delete | Multi-user or multi-tenant deployments, per-dataset lifecycle (delete a dataset, drop its database) |
-| `false` | One shared database (`graph_database_name`, default `cognee`) for every dataset and user; `prune_system` empties it but keeps the database | Single-user scripts, notebooks, benchmarks |
+| `false` | One shared database (`graph_database_name`, default `cognee`) for every dataset and user; `prune_system` empties it but keeps the database | Single-user scripts and notebooks |
 
 What the isolation does and does not give you:
 

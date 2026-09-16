@@ -681,9 +681,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-bench = [
-    { name = "neo4j" },
-]
 dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -703,14 +700,13 @@ requires-dist = [
     { name = "instructor", specifier = ">=1.11" },
     { name = "ladybug", specifier = "<0.18" },
     { name = "litellm", specifier = "==1.89.2" },
-    { name = "neo4j", marker = "extra == 'bench'", specifier = ">=5.28.0,<6" },
     { name = "onnxruntime", marker = "extra == 'llm'", specifier = ">=1.17" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "starlette", specifier = ">=0.48.0" },
     { name = "typedb-driver", specifier = ">=3.12.0,<4" },
 ]
-provides-extras = ["dev", "llm", "bench"]
+provides-extras = ["dev", "llm"]
 
 [[package]]
 name = "colorama"
@@ -2090,19 +2086,6 @@ wheels = [
 ]
 
 [[package]]
-name = "neo4j"
-version = "5.28.5"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pytz" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a9/fc/56d23ba3eed18ad3cfece6fadc52a2386d16627e8d96554f43b14984e857/neo4j-5.28.5.tar.gz", hash = "sha256:22c17254dc99cded006ff8d1904fe4c8a09d2b67f4e02709bfeca95786b1b58d", size = 232775, upload-time = "2026-08-28T10:26:35.047Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/aa/fc/4e379b0bdecf3a22ec4581a594349f88546ee0a6e0d3cbd8941013e1411a/neo4j-5.28.5-py3-none-any.whl", hash = "sha256:b5a919bb7be2dd0ccb72acd52724964b73f1bb5f5c753a031af84dbbe170fbf3", size = 313920, upload-time = "2026-08-28T10:26:32.667Z" },
-    { url = "https://files.pythonhosted.org/packages/0c/9b/ecd432ccda4c4a1015e46a19645922cad7304cf37012982b22b2777a29c2/neo4j-5.28.5.0-py3-none-any.whl", hash = "sha256:c8ab75a72d54f2aceea35a22d1cd39203f754777c6ec8ccb3d9e6d4d8b8bdd4e", size = 313958, upload-time = "2026-08-31T08:45:18.428Z" },
-]
-
-[[package]]
 name = "networkx"
 version = "3.4.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3010,15 +2993,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/68/d4/00ffdbd370410c04e9591da9220a68dc1693ef7499173eb3e30d06e05ed1/pytokens-0.4.1-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:970b08dd6b86058b6dc07efe9e98414f5102974716232d10f32ff39701e841c4", size = 266859, upload-time = "2026-01-30T01:03:17.458Z" },
     { url = "https://files.pythonhosted.org/packages/a7/c9/c3161313b4ca0c601eeefabd3d3b576edaa9afdefd32da97210700e47652/pytokens-0.4.1-cp313-cp313-win_amd64.whl", hash = "sha256:9bd7d7f544d362576be74f9d5901a22f317efc20046efe2034dced238cbbfe78", size = 103520, upload-time = "2026-01-30T01:03:18.652Z" },
     { url = "https://files.pythonhosted.org/packages/c6/78/397db326746f0a342855b81216ae1f0a32965deccfd7c830a2dbc66d2483/pytokens-0.4.1-py3-none-any.whl", hash = "sha256:26cef14744a8385f35d0e095dc8b3a7583f6c953c2e3d269c7f82484bf5ad2de", size = 13729, upload-time = "2026-01-30T01:03:45.029Z" },
-]
-
-[[package]]
-name = "pytz"
-version = "2026.3.post1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/fb/48/fb042503b6ca6cd271261dc559fd6432f7d8c713153e9ec5c591af4dfc1c/pytz-2026.3.post1.tar.gz", hash = "sha256:2211d3fcf9a797d3405cac96ac7f61d80e6a644f72a3309607282fe8a2010c5d", size = 319745, upload-time = "2026-07-25T15:12:07.385Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0f/7b/39c34ca613b0b198cb866466651b26b045e2009864c5183c979a3b83f383/pytz-2026.3.post1-py2.py3-none-any.whl", hash = "sha256:dd95840dd199baea12d9cc096a1d452caa6596a1c1e4b5f3dbd1541855d5e815", size = 508283, upload-time = "2026-07-25T15:12:05.782Z" },
 ]
 
 [[package]]

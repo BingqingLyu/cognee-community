@@ -134,8 +134,8 @@ def _link_deletes(template: str, **fields) -> list[str]:
 
 
 # Incident edges of an anchor node, one query per role the anchor plays (an
-# `or` over the role is 12-18x slower than two directional queries — see
-# benchmarks/README.md). Both produce the same document shape; self-loops
+# `or` over the role is 12-18x slower than two directional queries). Both
+# produce the same document shape; self-loops
 # appear in both and consumers de-duplicate by (source, target, rel). Only
 # the far endpoint's document is fetched — the anchor is always already
 # known to every consumer, and hub nodes would otherwise ship their payload
@@ -238,8 +238,9 @@ update $r has source-run-id == $run;
 
 def _links_read_query(kind: str, link: str) -> str:
     """One row per provenance link of each given artifact: its position and
-    the ref's key. Keep the per-link fetch form (see benchmarks/README.md
-    for the server behaviour a join-based select triggers)."""
+    the ref's key. Keep the per-link fetch form: a select that joins the key
+    through the ref entity, followed by link inserts in the same
+    transaction, runs far slower on TypeDB 3.12."""
     _entity, key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
     return (
         "given $id: string;\n"
@@ -261,7 +262,7 @@ def _links_fetch_list(var: str, link: str) -> str:
 def _ref_lookup_query(link: str) -> str:
     """Resolve ref entities by key, once per transaction. Links are then
     written against the entity's IID: a key lookup per row would scan, since
-    every key of a dataset shares a long prefix (benchmarks/README.md)."""
+    every key of a dataset shares a long prefix."""
     entity, key_attr, _derived, _relation, _role = _PROVENANCE_LINKS[link]
     return f"given $v: string;\nmatch $r isa {entity}, has {key_attr} == $v;\nselect $v, $r;"
 

@@ -3338,28 +3338,6 @@ docs = ["intersphinx-registry", "myst-parser", "pydata-sphinx-theme", "sphinx", 
 test = ["packaging", "pre-commit", "pytest", "testpath"]
 
 [[package]]
-name = "neo4j"
-version = "5.28.5"
-description = "Neo4j Bolt driver for Python"
-optional = true
-python-versions = ">=3.7"
-groups = ["main"]
-markers = "(python_version == \"3.11\" or python_version == \"3.10\" or python_version == \"3.12\" or python_version == \"3.13\") and extra == \"bench\""
-files = [
-    {file = "neo4j-5.28.5-py3-none-any.whl", hash = "sha256:b5a919bb7be2dd0ccb72acd52724964b73f1bb5f5c753a031af84dbbe170fbf3"},
-    {file = "neo4j-5.28.5.0-py3-none-any.whl", hash = "sha256:c8ab75a72d54f2aceea35a22d1cd39203f754777c6ec8ccb3d9e6d4d8b8bdd4e"},
-    {file = "neo4j-5.28.5.tar.gz", hash = "sha256:22c17254dc99cded006ff8d1904fe4c8a09d2b67f4e02709bfeca95786b1b58d"},
-]
-
-[package.dependencies]
-pytz = "*"
-
-[package.extras]
-numpy = ["numpy (>=1.7.0,<3.0.0)"]
-pandas = ["numpy (>=1.7.0,<3.0.0)", "pandas (>=1.1.0,<3.0.0)"]
-pyarrow = ["pyarrow (>=1.0.0)"]
-
-[[package]]
 name = "networkx"
 version = "3.4.2"
 description = "Python package for creating and manipulating graphs and networks"
@@ -4610,19 +4588,6 @@ files = [
 
 [package.extras]
 dev = ["black", "build", "mypy", "pytest", "pytest-cov", "setuptools", "tox", "twine", "wheel"]
-
-[[package]]
-name = "pytz"
-version = "2026.3.post1"
-description = "World timezone definitions, modern and historical"
-optional = true
-python-versions = "*"
-groups = ["main"]
-markers = "(python_version == \"3.11\" or python_version == \"3.10\" or python_version == \"3.12\" or python_version == \"3.13\") and extra == \"bench\""
-files = [
-    {file = "pytz-2026.3.post1-py2.py3-none-any.whl", hash = "sha256:dd95840dd199baea12d9cc096a1d452caa6596a1c1e4b5f3dbd1541855d5e815"},
-    {file = "pytz-2026.3.post1.tar.gz", hash = "sha256:2211d3fcf9a797d3405cac96ac7f61d80e6a644f72a3309607282fe8a2010c5d"},
-]
 
 [[package]]
 name = "pywin32"
@@ -6037,11 +6002,10 @@ test = ["big-O", "jaraco.functools", "jaraco.itertools", "jaraco.test", "more_it
 type = ["pytest-mypy (>=1.0.1)"]
 
 [extras]
-bench = ["neo4j"]
 dev = ["pytest", "pytest-asyncio"]
 llm = ["anthropic", "fastembed", "onnxruntime"]
 
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.14"
-content-hash = "236547ac5f4ad15a7a9daba1ceefaa0219948ba37a97ca46c697fd34cdfb9752"
+content-hash = "03acf650d9d12b542e71b50094d58bbb1e94b71ba964446be44e1b825527bb47"

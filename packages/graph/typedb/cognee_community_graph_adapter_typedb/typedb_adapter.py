@@ -90,7 +90,8 @@ TLS_ENV = "TYPEDB_TLS"
 TLS_ROOT_CA_ENV = "TYPEDB_TLS_ROOT_CA"
 
 # Batch writes are split into transactions of this many rows, with up to
-# WRITE_CONCURRENCY transactions in flight (both tuned in benchmarks/README.md).
+# WRITE_CONCURRENCY transactions in flight (measured defaults: per-row cost
+# grows superlinearly with rows per transaction; four in flight is the knee).
 # Defaults; per-adapter values come from TYPEDB_WRITE_CHUNK_ROWS /
 # TYPEDB_WRITE_CONCURRENCY when set (read at construction).
 WRITE_CHUNK_ROWS = 100

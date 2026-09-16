@@ -31,10 +31,6 @@ llm = [
     "fastembed>=0.4",
     "onnxruntime>=1.17",
 ]
-# Comparative benchmarks against cognee's built-in Neo4j adapter (benchmarks/).
-bench = [
-    "neo4j>=5.28.0,<6",  # cognee 1.4.2's own neo4j extra pins the same floor
-]
 
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"
@@ -62,7 +58,5 @@ select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
 "__init__.py" = ["F401"]
 # RUF012: pydantic model fields on DataPoint subclasses are not class vars.
 "tests/**" = ["RUF012"]
-# Benchmark scripts: pydantic fields, long print lines, small lambdas.
-"benchmarks/**" = ["RUF012", "E501", "E731"]
 # Dataset handler module is CamelCase by cognee convention (Neo4jDatasetDatabaseHandler.py etc.).
 "cognee_community_graph_adapter_typedb/TypeDBDatasetDatabaseHandler.py" = ["N999"]
