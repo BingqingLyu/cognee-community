@@ -27,12 +27,15 @@ async def second(adapter):
     await other.close()
 
 
-async def _provenance_json_rows(adapter, node_id):
-    return await adapter.query(
-        "given $id: string; match $n isa node, has node-id == $id, has provenance-json $p;"
-        " select $p;",
+async def _ref_links(adapter, node_id):
+    """(key, position) of the node's source-ref links, in attach order."""
+    rows = await adapter.query(
+        "given $id: string; match $n isa node, has node-id == $id;"
+        " $l isa sourced-from, links (artifact: $n, ref: $r), has position $p;"
+        " $r has source-ref-key $k; select $k, $p;",
         {"id": node_id},
     )
+    return sorted((row["k"], row["p"]) for row in rows)
 
 
 async def test_concurrent_folded_attach_on_existing_node_keeps_all_keys(adapter, second):
@@ -51,7 +54,9 @@ async def test_concurrent_folded_attach_on_existing_node_keeps_all_keys(adapter,
         snap = (await adapter.get_node_delete_data([node_id]))[node_id]
         assert sorted(snap.source_ref_keys) == sorted(keys)
         assert sorted(snap.source_run_refs) == sorted(make_source_run_ref(run, k) for k in keys)
-        assert len(await _provenance_json_rows(adapter, node_id)) == 1
+        links = await _ref_links(adapter, node_id)
+        assert [k for k, _ in links] == sorted(snap.source_ref_keys)  # one link per key
+        assert len({p for _, p in links}) == len(links)  # distinct positions
 
 
 async def test_concurrent_explicit_attach_across_instances_keeps_all_keys(adapter, second):
@@ -70,7 +75,9 @@ async def test_concurrent_explicit_attach_across_instances_keeps_all_keys(adapte
 
         snap = (await adapter.get_node_delete_data([node_id]))[node_id]
         assert sorted(snap.source_ref_keys) == sorted(keys[:3])
-        assert len(await _provenance_json_rows(adapter, node_id)) == 1
+        links = await _ref_links(adapter, node_id)
+        assert [k for k, _ in links] == sorted(snap.source_ref_keys)  # one link per key
+        assert len({p for _, p in links}) == len(links)  # distinct positions
 
 
 async def test_concurrent_property_mutations_all_land(adapter, second):

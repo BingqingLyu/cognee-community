@@ -8,6 +8,7 @@ from cognee_community_graph_adapter_typedb.typedb_adapter import (
     WRITE_CHUNK_ROWS,
     WRITE_CONCURRENCY,
     TypeDBAdapter,
+    _ProvenanceAttach,
 )
 
 STC2 = "\n[STC2] Commit in database 'x' failed with isolation conflict: ..."
@@ -125,15 +126,36 @@ async def test_reads_short_circuit_when_the_database_is_missing():
     assert set(calls) == {"_database_exists_sync"}
 
 
-async def test_provenance_chunks_run_serially_and_fold_each_chunk():
-    """With provenance, every chunk is one transaction (upsert + attach) and
-    chunks never overlap, whatever the write concurrency."""
+def _attach(with_refs: bool = False):
+    """A provenance change with a real key and run ref (the ref put derives
+    dataset and run ids from them) and a no-op transition."""
+    from uuid import uuid4
+
+    from cognee.infrastructure.databases.provenance import (
+        make_source_ref_key,
+        make_source_run_ref,
+    )
+
+    if not with_refs:
+        return _ProvenanceAttach(lambda current, refs: None)
+    key, run = make_source_ref_key(uuid4(), uuid4()), uuid4()
+    return _ProvenanceAttach(lambda current, refs: None, [key], [make_source_run_ref(run, key)])
+
+
+async def test_provenance_batches_put_refs_first_then_fold_each_chunk():
+    """With provenance, the ref entities are put in their own transaction
+    before any chunk, then every chunk is one transaction (upsert + attach)
+    and chunks run concurrently like any other write."""
     adapter = _offline_adapter()
-    in_flight, max_in_flight, folded = 0, 0, []
+    in_flight, max_in_flight, folded, batches = 0, 0, [], []
 
     async def fake_run_sync(fn, *args):
         nonlocal in_flight, max_in_flight
-        assert fn.__func__ is TypeDBAdapter._provenance_change_sync
+        if fn.__name__ != "_provenance_change_sync":
+            if fn.__name__ == "_run_batch_sync":
+                batches.append([query for query, _rows in args[0]])
+                assert not folded  # refs are put before the first chunk
+            return []
         kind, identities, _transition, specs = args
         in_flight += 1
         max_in_flight = max(max_in_flight, in_flight)
@@ -143,10 +165,11 @@ async def test_provenance_chunks_run_serially_and_fold_each_chunk():
 
     adapter._run_sync = fake_run_sync
     rows = [{"id": str(i)} for i in range(WRITE_CHUNK_ROWS * 3)]
-    await adapter._write_rows("template", rows, provenance=("node", "id", lambda k, r: None))
+    await adapter._write_rows("template", rows, provenance=("node", "id", _attach(True)))
 
-    assert max_in_flight == 1
-    assert [len(ids) for _, ids, _ in folded] == [WRITE_CHUNK_ROWS] * 3
+    assert len(batches) == 1 and len(batches[0]) == 2  # one put for refs, one for run refs
+    assert max_in_flight > 1
+    assert sorted(len(ids) for _, ids, _ in folded) == [WRITE_CHUNK_ROWS] * 3
     assert all(ids == upserted for _, ids, upserted in folded)  # attach covers the chunk's rows
 
 
@@ -157,15 +180,22 @@ async def test_provenance_chunk_failure_stops_the_batch():
     seen = []
 
     async def fake_run_sync(fn, *args):
+        if fn.__name__ != "_provenance_change_sync":
+            return []
         seen.append(args[1][0])
         if len(seen) == 2:
             raise RuntimeError("chunk 2 failed")
+        await asyncio.sleep(0.05)  # still in flight when the failure is observed
 
     adapter._run_sync = fake_run_sync
-    rows = [{"id": str(i)} for i in range(WRITE_CHUNK_ROWS * 4)]
+    rows = [{"id": str(i)} for i in range(WRITE_CHUNK_ROWS * (WRITE_CONCURRENCY + 2))]
     with pytest.raises(RuntimeError, match="chunk 2 failed"):
-        await adapter._write_rows("template", rows, provenance=("node", "id", lambda k, r: None))
-    assert seen == ["0", str(WRITE_CHUNK_ROWS)]
+        await adapter._write_rows("template", rows, provenance=("node", "id", _attach()))
+    # Chunks already in flight finish. The slot freed by the failing chunk can
+    # be grabbed by the next waiter in the same loop tick before gather()
+    # cancels, so at most one extra chunk starts; the last one never runs.
+    assert len(seen) <= WRITE_CONCURRENCY + 1
+    assert str(WRITE_CHUNK_ROWS * (WRITE_CONCURRENCY + 1)) not in seen
 
 
 class _RecordingTransaction:
@@ -205,7 +235,7 @@ async def test_folded_chunk_is_one_transaction():
             return _RecordingTransaction(log)
 
     adapter._get_driver = lambda: _Driver()
-    adapter._collect_answer = lambda answer: [{"id": "n1", "pj": None}]
+    adapter._collect_answer = lambda answer: []  # no links yet
 
     def transition_that_fails(keys, run_refs):
         raise RuntimeError("attach failed")

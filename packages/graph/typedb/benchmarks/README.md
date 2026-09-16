@@ -24,11 +24,14 @@ the ratios are what matter.
    worth keeping for round trips, but it is not the lever.
 2. **Concurrent transactions help up to 4 in flight** and hurt at 8, and
    more native drivers only add contention: one driver per adapter.
-3. **Provenance costs a serial pass.** Every row of a provenance batch owns
-   the same source-ref key, dataset id and run id, and TypeDB conflicts
-   concurrent inserts of ownership of the same long string value, so the
-   fold runs one chunk at a time. That is the gap between the bare upsert
-   (7,900 nodes/s at 5k) and `add_nodes` with provenance (2,300).
+3. **Provenance must not put shared strings on artifacts.** TypeDB
+   conflicts concurrent inserts of ownership of the same long string value,
+   and every row of a provenance batch carries the same source-ref key,
+   dataset id and run id. Stored as artifact attributes, the fold had to
+   run one chunk at a time (2,300 nodes/s at 5k). Stored as one entity per
+   ref with a link per artifact, chunks run concurrently again: 4,100
+   nodes/s and 4,300 edges/s with provenance, against 7,900 / 2,950 for the
+   bare upsert.
 4. **The set-once `created-at` negation was the node-write cost** (826
    rows/s against 18,000 without it), so nodes mirror the payload's
    `created_at` instead; edges keep the set-once statement.
@@ -44,8 +47,11 @@ the ratios are what matter.
 - `add_nodes` / `add_edges` chunk rows into transactions of
   `TYPEDB_WRITE_CHUNK_ROWS` (100) with up to `TYPEDB_WRITE_CONCURRENCY` (4)
   in flight; provenance-carrying chunks fold the attach into their
-  transaction and run serially; commit conflicts retry against a time
-  budget. A batch does not commit atomically (nor do the sibling adapters').
+  transaction (links to ref entities put beforehand) and run concurrently;
+  commit conflicts retry against a time budget. A batch does not commit
+  atomically (nor do the sibling adapters').
+- Provenance is relational (`source-ref` / `run-ref` entities, `sourced-from`
+  / `run-attached` links with a `position`), never attributes on artifacts.
 - Incident-edge sweeps run as two directional queries.
 - Node `created-at` mirrors the DataPoint payload's own `created_at`,
   written in the `update` stage; edges keep set-once semantics.
@@ -94,53 +100,54 @@ already buffered in it.
 
 `compare_adapters.py` runs one workload through cognee's `GraphDBInterface`
 on each backend: TypeDB 3.12.3 (this adapter as shipped: 100-row chunks,
-4 in flight, provenance folded per chunk and serialized), Ladybug 0.17.1
+4 in flight, provenance folded per chunk as links to ref entities), Ladybug 0.17.1
 (cognee's default, embedded in-process) and Neo4j 5.28 community (cognee's
 built-in adapter, dockerized, no GDS plugin). Same laptop, same seeded data
 (random uuid4 ids, 400–900-char payloads), wall time per step. The TypeDB
-column was re-measured after the fold was restored, twenty minutes after
-the Ladybug and Neo4j columns, on an otherwise idle machine.
+column was re-measured with the relational provenance model a week after
+the Ladybug and Neo4j columns, on the same otherwise idle machine.
 
 | step (5,000 nodes / 7,500 edges) | TypeDB | Ladybug | Neo4j |
 |---|---|---|---|
-| `add_nodes` + provenance | 2.19 s | 0.27 s | 1.14 s |
-| `add_edges` + provenance | 4.87 s | 0.72 s | 1.89 s |
-| re-upsert 5,000 nodes (second run id) | 1.16 s | 0.35 s | 0.91 s |
-| `get_graph_data` (12,500 rows) | 0.68 s | 0.05 s | 2.25 s |
-| `get_neighborhood` (10 seeds, depth 2) | 67 ms | 14 ms | 138 ms |
-| `get_edges` × 100 nodes | 174 ms | 141 ms | 252 ms |
-| `get_id_filtered_graph_data` (200 ids) | 63 ms | 16 ms | 157 ms |
+| `add_nodes` + provenance | 1.21 s | 0.27 s | 1.14 s |
+| `add_edges` + provenance | 1.76 s | 0.72 s | 1.89 s |
+| re-upsert 5,000 nodes (second run id) | 0.70 s | 0.35 s | 0.91 s |
+| `get_graph_data` (12,500 rows) | 0.44 s | 0.05 s | 2.25 s |
+| `get_neighborhood` (10 seeds, depth 2) | 52 ms | 14 ms | 138 ms |
+| `get_edges` × 100 nodes | 150 ms | 141 ms | 252 ms |
+| `get_id_filtered_graph_data` (200 ids) | 50 ms | 16 ms | 157 ms |
 | `get_graph_metrics` | 0.30 s | 1.00 s | needs GDS |
-| `find_nodes_by_source_ref` + `get_node_delete_data` (500) | 236 ms | 15 ms | 704 ms |
-| `delete_nodes` (500) | 195 ms | 21 ms | 73 ms |
-| 4 concurrent `add_nodes` (5,000 total, provenance) | 2.00 s | 0.50 s | 0.54 s |
+| `find_nodes_by_source_ref` + `get_node_delete_data` (500) | 423 ms | 15 ms | 704 ms |
+| `delete_nodes` (500) | 355 ms | 21 ms | 73 ms |
+| 4 concurrent `add_nodes` (5,000 total, provenance) | 1.07 s | 0.50 s | 0.54 s |
 
 | step (1,000 nodes / 1,500 edges) | TypeDB | Ladybug | Neo4j |
 |---|---|---|---|
-| `add_nodes` + provenance | 0.74 s | 0.11 s | 0.25 s |
-| `add_edges` + provenance | 1.28 s | 0.11 s | 0.61 s |
-| re-upsert 1,000 nodes | 0.23 s | 0.08 s | 0.20 s |
-| `get_graph_data` (2,500 rows) | 0.12 s | 0.01 s | 0.43 s |
-| `get_neighborhood` (10 seeds, depth 2) | 40 ms | 9 ms | 81 ms |
-| `get_graph_metrics` | 64 ms | 210 ms | needs GDS |
-| `delete_nodes` (500) | 159 ms | 16 ms | 60 ms |
+| `add_nodes` + provenance | 0.47 s | 0.11 s | 0.25 s |
+| `add_edges` + provenance | 0.73 s | 0.11 s | 0.61 s |
+| re-upsert 1,000 nodes | 0.16 s | 0.08 s | 0.20 s |
+| `get_graph_data` (2,500 rows) | 0.08 s | 0.01 s | 0.43 s |
+| `get_neighborhood` (10 seeds, depth 2) | 28 ms | 9 ms | 81 ms |
+| `get_graph_metrics` | 62 ms | 210 ms | needs GDS |
+| `delete_nodes` (500) | 311 ms | 16 ms | 60 ms |
 
 Reading it (ratios from the 5k table):
 
 - **Ladybug, embedded in-process, is faster at everything except
-  `get_graph_metrics`** (TypeDB about 3.3× faster there, at both sizes): 1.2×
-  on `get_edges`, 3–5× on re-upsert, neighborhoods and id-filtered
-  projections, 7–8× on bulk writes, 9–16× on `get_graph_data`, deletes and
+  `get_graph_metrics`** (TypeDB about 3.3× faster there, at both sizes):
+  1.1× on `get_edges`, 2–4× on bulk writes, re-upsert, neighborhoods and
+  id-filtered projections, 9× on `get_graph_data`, 17–28× on deletes and
   the delete planner. That is the price of a server with commit isolation
   and per-dataset databases, not of this adapter.
-- **Against Neo4j, the other server: TypeDB is 1.3–2.6× slower on bulk
-  writes** (re-upsert 1.3×, `add_nodes` 1.9×, `add_edges` 2.6×; 3.7× on
-  four concurrent provenance-carrying `add_nodes` calls, which serialize
-  their chunks) **and 1.5–3.3× faster on the read paths cognee hits most**:
-  `get_graph_data` 3.3× (projected on every GRAPH_COMPLETION search),
-  neighborhoods 2.1×, id-filtered projections 2.5×, the delete planner's
-  provenance lookups 3.0×, `get_edges` 1.5×. `delete_nodes` is 2.7× slower
-  (the edge cascade is a separate query).
+- **Against Neo4j, the other server: TypeDB is on par or faster on bulk
+  writes** (`add_nodes` 0.94×, `add_edges` 0.93×, re-upsert 0.77× of Neo4j's
+  time; four concurrent provenance-carrying `add_nodes` calls 2.0× slower,
+  since one adapter's four slots are shared by all callers) **and 1.7–5×
+  faster on the read paths cognee hits most**: `get_graph_data` 5.1×
+  (projected on every GRAPH_COMPLETION search), neighborhoods 2.7×,
+  id-filtered projections 3.1×, the delete planner's provenance lookups
+  1.7×, `get_edges` 1.7×. `delete_nodes` is 4.9× slower (the edge cascade
+  and the provenance-link cascade are separate queries).
 - Both comparisons use random ids; see the shared-prefix observation below
   for why that matters.
 
@@ -178,11 +185,19 @@ Reading it (ratios from the 5k table):
   conflicts across 20 concurrent 50-row transactions; 24 chars and up, 9–15
   (all the way to a shared 600-char `properties-json`). Distinct values
   never conflict, and pre-creating the attribute instance in its own
-  transaction changes nothing. This matters for cognee: every row of a
-  provenance batch owns the same `source-ref-key` (86 chars) and run /
-  dataset ids (36 chars), so the adapter runs provenance-carrying chunks
-  one at a time per adapter, and writers in other adapter instances retry
-  against a time budget.
+  transaction changes nothing. Relations linking many artifacts to one
+  entity that owns the value do not conflict (0 retries for 5,000 links to
+  one hub from 4 concurrent writers), which is how the adapter stores
+  provenance. Writes to the same owner from two transactions always
+  conflict (an integer `update`, or inserting two distinct short
+  attributes), which the adapter relies on to serialize changes to one
+  artifact.
+- **A `select` that reads an entity's relations by joining through the
+  other role player's key, followed by inserts of more such relations in
+  the same transaction, runs ~70× slower** than the same read written as a
+  per-relation `fetch` (87 vs 5,974 rows/s for 100-row chunks linking to
+  one hub; either read alone is fast). The adapter's link reads use the
+  fetch form.
 - `{ $s has $a; } or { $t has $a; }` (disjunction over the role a bound
   node plays) is 12–18× slower than two role-specific queries.
 - `typeql-check` accepts `from` as a role label; the server rejects it

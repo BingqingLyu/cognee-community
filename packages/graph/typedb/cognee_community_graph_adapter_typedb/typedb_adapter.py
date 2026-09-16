@@ -13,29 +13,26 @@ identity and ``edge-object-id`` (cognee's deterministic feedback id).
 Graph-native provenance follows cognee's contract exactly by delegating the
 state transitions to ``provenance_after_attach`` / ``provenance_after_remove``
 (Model A: a pipeline run is recorded against a source ref only when that ref
-is newly attached). Each node and edge keeps the ordered record in
-``provenance-json`` (canonical, because TypeDB's multi-valued attributes are
-unordered and cognee asserts attach order) and mirrors it into four
-multi-valued lookup attributes (``source-ref-key``, ``source-dataset-id``,
-``source-run-id``, ``source-run-ref``). Every provenance change is a
-read-modify-write transaction. ``add_nodes`` / ``add_edges`` fold the
-attach into each chunk's transaction (upsert, read the record, apply the
-transition, write the diff, commit), so no artifact is ever visible
-without its provenance, the invariant cognee's rollback and delete
-planners rely on. Chunks that carry provenance run one at a time under the
-adapter's provenance lock: TypeDB conflicts concurrent inserts of
-ownership of the same string value longer than 16 to 24 characters
-(benchmarks/README.md), every row of a batch owns the same source-ref key,
-dataset id and run id, and pre-creating the attribute does not help, so
-concurrent provenance chunks only retried each other. Serial 100-row
-chunks are the fastest shape that keeps the per-chunk fold (a two-phase
-upsert-then-attach measured ~30 % faster and was rejected for the window
-it opens). Writers in other adapter instances or processes still conflict
+is newly attached). The record is relational: one ``source-ref`` entity per
+key (owning the key and its dataset id) and one ``run-ref`` entity per run
+ref (owning the ref and its run id), linked to their artifacts by
+``sourced-from`` / ``run-attached`` relations whose ``position`` attribute
+is the attach order (cognee asserts it, and TypeDB's multi-valued
+attributes are unordered). The ref entities are ``put`` once per batch
+before its chunks run, so a chunk only looks a ref up and links to it. That
+matters because TypeDB conflicts concurrent inserts of *ownership* of the
+same long string value (benchmarks/README.md): artifacts own nothing
+shared, so provenance-carrying chunks run concurrently like any other
+write, and ``add_nodes`` / ``add_edges`` fold the attach into each chunk's
+transaction (upsert, read the links, apply the transition, link or unlink
+for the difference, commit), so no artifact is ever visible without its
+provenance, the invariant cognee's rollback and delete planners rely on.
+Writers in other adapter instances that touch the same artifact conflict
 at commit (``[STC2]``, verified in ``tests/integration/test_concurrency.py``
-and ``test_stress.py``); conflicts are retried against a re-read of the
-record within a time budget rather than a fixed count, because the loser
-of a sustained contest loses every round until the other writer's batch
-ends.
+and ``test_stress.py``) and are retried against a re-read within a time
+budget. Deleting an artifact must also delete its links: TypeDB keeps a
+relation whose role player was deleted, so every delete path removes the
+links first.
 
 A node's ``created-at`` mirrors its DataPoint payload's ``created_at``; an
 edge's is set once on first write; ``updated-at`` is the write time (all
@@ -65,6 +62,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -81,6 +79,7 @@ from cognee.infrastructure.databases.provenance import (
     get_dataset_id_from_source_ref_key,
     get_pipeline_run_id_from_source_run_ref,
     get_source_ref_key_from_source_run_ref,
+    make_source_run_ref,
 )
 from cognee.infrastructure.databases.provenance.source_ref_state import (
     ProvenanceColumns,
@@ -190,6 +189,40 @@ given $id: string;
 match $n isa node, has node-id == $id;
 delete $n;
 """
+
+# Provenance links of artifacts about to be deleted (TypeDB does not remove a
+# relation when a role player is deleted). One template per artifact
+# selection, formatted with the link relation type.
+_DELETE_LINKS_OF_NODES = """
+given $id: string;
+match $n isa node, has node-id == $id; $l isa {link}, links (artifact: $n);
+delete $l;
+"""
+_DELETE_LINKS_OF_INCIDENT_EDGES = """
+given $id: string;
+match $n isa node, has node-id == $id; $e isa edge, links ($n); $l isa {link}, links (artifact: $e);
+delete $l;
+"""
+_DELETE_LINKS_OF_EDGES_BY_KEY = """
+given $id: string;
+match $e isa edge, has edge-key == $id; $l isa {link}, links (artifact: $e);
+delete $l;
+"""
+_DELETE_LINKS_OF_LABELED_EDGES = """
+given $id: string, $label: string;
+match
+  $n isa node, has node-id == $id;
+  $e isa edge, links ({anchor_role}: $n), has relationship-name == $label;
+  $l isa {link}, links (artifact: $e);
+delete $l;
+"""
+_LINK_TYPES = ("sourced-from", "run-attached")
+
+
+def _link_deletes(template: str, **fields) -> list[str]:
+    """The two link-deletion statements (one per link type) for a template."""
+    return [template.format(link=link, **fields) for link in _LINK_TYPES]
+
 
 # Incident edges of an anchor node, one query per role the anchor plays (an
 # `or` over the role is 12-18x slower than two directional queries — see
@@ -306,41 +339,102 @@ _MATCH_BY_ID = {
     "node": "$x isa node, has node-id == $id;",
     "edge": "$x isa edge, has edge-key == $id;",
 }
-# ProvenanceColumns field -> indexed set attribute.
-_PROVENANCE_ATTRS = {
-    "source_ref_keys": "source-ref-key",
-    "source_dataset_ids": "source-dataset-id",
-    "source_run_ids": "source-run-id",
-    "source_run_refs": "source-run-ref",
+# Provenance link kinds: (ref entity type, its key attribute, its derived-id
+# attribute, link relation type, the ref's role in it).
+_PROVENANCE_LINKS = {
+    "ref": ("source-ref", "source-ref-key", "source-dataset-id", "sourced-from", "ref"),
+    "run": ("run-ref", "source-run-ref", "source-run-id", "run-attached", "run"),
 }
 
+# Ref entities are put once per batch, before the chunks that link to them.
+_PUT_SOURCE_REF = """
+given $k: string, $d: string;
+put $r isa source-ref, has source-ref-key == $k;
+update $r has source-dataset-id == $d;
+"""
+_PUT_RUN_REF = """
+given $k: string, $run: string;
+put $r isa run-ref, has source-run-ref == $k;
+update $r has source-run-id == $run;
+"""
 
-def _provenance_read_query(kind: str) -> str:
+
+def _links_read_query(kind: str, link: str) -> str:
+    """One row per provenance link of each given artifact: its position and
+    the ref's key. Written as a per-link fetch on purpose: a `select` that
+    joins the key through the ref entity, followed by link inserts in the
+    same transaction, runs ~70x slower (benchmarks/README.md)."""
+    _entity, key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
     return (
         "given $id: string;\n"
-        f"match {_MATCH_BY_ID[kind]}\n"
-        'fetch { "id": $id, "pj": $x.provenance-json,'
-        ' "keys": [ $x.source-ref-key ], "datasets": [ $x.source-dataset-id ],'
-        ' "runs": [ $x.source-run-id ], "runrefs": [ $x.source-run-ref ] };'
+        f"match {_MATCH_BY_ID[kind]} $l isa {relation}, links (artifact: $x, {role}: $r);\n"
+        f'fetch {{ "id": $id, "p": $l.position, "k": $r.{key_attr} }};'
     )
 
 
-def _attr_insert_query(kind: str, attribute: str) -> str:
+def _links_fetch_list(var: str, link: str) -> str:
+    """A fetch sub-query listing ``var``'s links of one kind (key + position)."""
+    _entity, key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
+    # Own variable names: the enclosing match may bind $l / $r to other types.
+    return (
+        f"[ match $pl_{link} isa {relation}, links (artifact: {var}, {role}: $pr_{link});"
+        f' fetch {{ "k": $pr_{link}.{key_attr}, "p": $pl_{link}.position }}; ]'
+    )
+
+
+def _link_insert_query(kind: str, link: str) -> str:
+    entity, key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
+    return (
+        "given $id: string, $v: string, $p: integer;\n"
+        f"match {_MATCH_BY_ID[kind]} $r isa {entity}, has {key_attr} == $v;\n"
+        # insert, not put: the read says the link is absent, and a `put`
+        # would scan the ref entity's existing links (thousands on a hub).
+        f"insert (artifact: $x, {role}: $r) isa {relation}, has position == $p;"
+    )
+
+
+def _touch_query(kind: str) -> str:
+    """Bump the artifact's updated-at. Every provenance change does this for
+    the artifacts it changed so that two writers changing one artifact
+    conflict at commit (TypeDB flags concurrent writes to one owner) and
+    the loser re-reads: without it, concurrent attaches of the same key
+    would both see it as new and link it twice."""
     match = _MATCH_BY_ID[kind]
-    return f"given $id: string, $v: string;\nmatch {match}\ninsert $x has {attribute} == $v;"
+    return f"given $id: string, $now: integer;\nmatch {match}\nupdate $x has updated-at == $now;"
 
 
-def _attr_delete_query(kind: str, attribute: str) -> str:
+def _link_delete_query(kind: str, link: str) -> str:
+    entity, key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
     return (
         "given $id: string, $v: string;\n"
-        f"match {_MATCH_BY_ID[kind]} $at isa {attribute} == $v; $x has $at;\n"
-        "delete has $at of $x;"
+        f"match {_MATCH_BY_ID[kind]} $r isa {entity}, has {key_attr} == $v;"
+        f" $l isa {relation}, links (artifact: $x, {role}: $r);\n"
+        "delete $l;"
     )
 
 
-def _attr_update_query(kind: str, attribute: str) -> str:
-    match = _MATCH_BY_ID[kind]
-    return f"given $id: string, $v: string;\nmatch {match}\nupdate $x has {attribute} == $v;"
+def _artifacts_by_ref_query(kind: str, link: str, by_derived: bool) -> str:
+    """Artifacts linked to a ref entity, selected by its key or its derived id,
+    with each artifact's full provenance links."""
+    entity, key_attr, derived_attr, relation, role = _PROVENANCE_LINKS[link]
+    attribute = derived_attr if by_derived else key_attr
+    if kind == "node":
+        return (
+            "given $v: string;\n"
+            f"match $r isa {entity}, has {attribute} == $v;"
+            f" $l isa {relation}, links (artifact: $n, {role}: $r); $n isa node, has node-id $id;\n"
+            f'fetch {{ "id": $id, "keys": {_links_fetch_list("$n", "ref")},'
+            f' "runs": {_links_fetch_list("$n", "run")} }};'
+        )
+    return (
+        "given $v: string;\n"
+        f"match $r isa {entity}, has {attribute} == $v;"
+        f" $l isa {relation}, links (artifact: $e, {role}: $r);"
+        " $e isa edge, links (source: $s, target: $t);"
+        " $s has node-id $sid; $t has node-id $tid; $e has relationship-name $rel;\n"
+        'fetch { "source": $sid, "target": $tid, "relationship_name": $rel,'
+        f' "keys": {_links_fetch_list("$e", "ref")}, "runs": {_links_fetch_list("$e", "run")} }};'
+    )
 
 
 def _properties_write_query(kind: str) -> str:
@@ -366,39 +460,24 @@ def _properties_read_query(kind: str, all_artifacts: bool) -> str:
     )
 
 
-_NODE_DELETE_DATA = """
+_NODE_DELETE_DATA = f"""
 given $id: string;
 match $n isa node, has node-id == $id;
-fetch { "node": { $n.* }, "pj": $n.provenance-json,
-        "keys": [ $n.source-ref-key ], "runrefs": [ $n.source-run-ref ] };
+fetch {{ "node": {{ $n.* }}, "keys": {_links_fetch_list("$n", "ref")},
+        "runs": {_links_fetch_list("$n", "run")} }};
 """
-_EDGE_DELETE_DATA = """
+_EDGE_DELETE_DATA = f"""
 given $id: string;
 match
   $e isa edge, has edge-key == $id, links (source: $s, target: $t);
   $s has node-id $sid; $t has node-id $tid; $e has relationship-name $rel;
-fetch { "source": $sid, "target": $tid, "relationship_name": $rel, "edge": { $e.* },
-        "pj": $e.provenance-json,
-        "keys": [ $e.source-ref-key ], "runrefs": [ $e.source-run-ref ] };
+fetch {{ "source": $sid, "target": $tid, "relationship_name": $rel, "edge": {{ $e.* }},
+        "keys": {_links_fetch_list("$e", "ref")}, "runs": {_links_fetch_list("$e", "run")} }};
 """
 _DELETE_EDGES_BY_KEY = """
 given $id: string;
 match $e isa edge, has edge-key == $id;
 delete $e;
-"""
-_NODES_BY_ATTR = """
-given $v: string;
-match $n isa node, has {attribute} == $v, has node-id $id;
-fetch {{ "id": $id, "pj": $n.provenance-json,
-        "keys": [ $n.source-ref-key ], "runrefs": [ $n.source-run-ref ] }};
-"""
-_EDGES_BY_ATTR = """
-given $v: string;
-match
-  $e isa edge, has {attribute} == $v, links (source: $s, target: $t);
-  $s has node-id $sid; $t has node-id $tid; $e has relationship-name $rel;
-fetch {{ "source": $sid, "target": $tid, "relationship_name": $rel, "pj": $e.provenance-json,
-        "keys": [ $e.source-ref-key ], "runrefs": [ $e.source-run-ref ] }};
 """
 _EDGES_BY_OBJECT_ID = """
 given $v: string;
@@ -425,6 +504,29 @@ fetch {{ "start": {{ $s.* }}, "edge": {{ $e.* }}, "end": {{ $t.* }} }};
 
 # Filterable attributes promoted out of properties-json, usable server-side.
 _PROMOTED_FILTER_ATTRS = {"type": "node-type", "name": "name"}
+
+
+@dataclass(frozen=True)
+class _ProvenanceAttach:
+    """One provenance change: the transition to apply per artifact, plus the
+    ref entities the change may link to (put before the chunks run)."""
+
+    transition: Any
+    keys: list[str] = field(default_factory=list)
+    run_refs: list[str] = field(default_factory=list)
+
+    @classmethod
+    def for_keys(cls, keys: list[str], run: str | None) -> "_ProvenanceAttach":
+        run_refs = [make_source_run_ref(run, key) for key in keys] if run else []
+        return cls(
+            lambda current, refs: provenance_after_attach(current, refs, keys, run),
+            keys,
+            run_refs,
+        )
+
+    @classmethod
+    def removing(cls, keys: list[str]) -> "_ProvenanceAttach":
+        return cls(lambda current, refs: provenance_after_remove(current, refs, keys))
 
 
 class TypeDBAdapter(GraphDBInterface):
@@ -471,9 +573,6 @@ class TypeDBAdapter(GraphDBInterface):
         self._commit_retry_seconds = COMMIT_RETRY_SECONDS
         # Caps in-flight chunk transactions across ALL concurrent batch calls.
         self._write_semaphore = asyncio.Semaphore(self._write_concurrency)
-        # Serializes every provenance write within this adapter: folded
-        # add_nodes/add_edges chunks and explicit attach/remove alike.
-        self._provenance_lock = asyncio.Lock()
         # Guards driver open/close and executor creation across threads.
         self._state_lock = threading.Lock()
         # Small dedicated pool: makes the concurrency ceiling on the shared
@@ -754,12 +853,11 @@ class TypeDBAdapter(GraphDBInterface):
         """Upsert rows as chunked transactions.
 
         ``created_query`` (with ``key``) adds the set-once created-at statement
-        to each chunk's transaction. Without ``provenance`` the chunks run
-        with WRITE_CONCURRENCY in flight. With ``provenance`` = (kind,
-        id_field, transition) each chunk's transaction also attaches
-        provenance to the rows it upserted (atomic per chunk), and the
-        chunks run one at a time under the provenance lock (module
-        docstring). Either way the batch is not atomic: on the first failure,
+        to each chunk's transaction. With ``provenance`` = (kind, id_field,
+        attach) each chunk's transaction also attaches provenance to the rows
+        it upserted (atomic per chunk); the ref entities it links to are put
+        first, in their own transaction. Chunks run with WRITE_CONCURRENCY in
+        flight either way. The batch is not atomic: on the first failure,
         chunks not yet started are cancelled and chunks already committed
         stay committed. A chunk whose transaction is in flight when the
         batch fails or the caller is cancelled runs to its end first (commit
@@ -776,17 +874,19 @@ class TypeDBAdapter(GraphDBInterface):
                 specs.append((created_query, [{key: row[key], "now": row["now"]} for row in chunk]))
             return specs
 
-        if provenance is not None:
-            kind, id_field, transition = provenance
-            await self._provision_database()
-            async with self._provenance_lock:
-                for chunk in chunks:
-                    await self._write_chunk(
-                        specs_for(chunk), (kind, [row[id_field] for row in chunk], transition)
-                    )
-            return
+        def provenance_for(chunk):
+            if provenance is None:
+                return None
+            kind, id_field, attach = provenance
+            return (kind, [row[id_field] for row in chunk], attach.transition)
 
-        tasks = [asyncio.create_task(self._write_chunk(specs_for(chunk))) for chunk in chunks]
+        if provenance is not None:
+            await self._ensure_provenance_refs(provenance[2])
+
+        tasks = [
+            asyncio.create_task(self._write_chunk(specs_for(chunk), provenance_for(chunk)))
+            for chunk in chunks
+        ]
         try:
             await asyncio.gather(*tasks)
         except BaseException:
@@ -818,34 +918,52 @@ class TypeDBAdapter(GraphDBInterface):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _decode_provenance(document: dict) -> tuple[list[str], list[str], ProvenanceColumns]:
-        """(ordered keys, ordered run refs, currently stored set columns)."""
-        keys, run_refs = [], []
-        raw = document.get("pj")
-        if raw:
-            try:
-                payload = json.loads(raw)
-                keys = list(payload.get("keys") or [])
-                run_refs = list(payload.get("run_refs") or [])
-            except (TypeError, ValueError):
-                logger.warning("Undecodable provenance-json on %s", document.get("id"))
-        stored = ProvenanceColumns(
-            list(document.get("keys") or []),
-            list(document.get("datasets") or []),
-            list(document.get("runs") or []),
-            list(document.get("runrefs") or []),
-        )
-        # The ordered JSON is canonical; fall back to the set index if absent.
-        return keys or stored.source_ref_keys, run_refs or stored.source_run_refs, stored
+    def _ordered_links(entries) -> list[str]:
+        """Keys of link entries ``{"k": key, "p": position}`` in attach order."""
+        return [entry["k"] for entry in sorted(entries or [], key=lambda entry: entry["p"])]
+
+    @classmethod
+    def _decode_provenance(cls, document: dict) -> tuple[list[str], list[str]]:
+        """(ordered source ref keys, ordered run refs) from a document carrying
+        ``keys`` / ``runs`` link lists."""
+        return cls._ordered_links(document.get("keys")), cls._ordered_links(document.get("runs"))
+
+    async def _ensure_provenance_refs(self, attach: "_ProvenanceAttach") -> None:
+        """Put the ref entities a change will link to (idempotent, retried)."""
+        specs = []
+        if attach.keys:
+            specs.append(
+                (
+                    _PUT_SOURCE_REF,
+                    [
+                        {"k": key, "d": str(get_dataset_id_from_source_ref_key(key))}
+                        for key in attach.keys
+                    ],
+                )
+            )
+        if attach.run_refs:
+            specs.append(
+                (
+                    _PUT_RUN_REF,
+                    [
+                        {"k": ref, "run": str(get_pipeline_run_id_from_source_run_ref(ref))}
+                        for ref in attach.run_refs
+                    ],
+                )
+            )
+        if specs:
+            await self._write_batch(specs)
 
     def _provenance_change_sync(self, kind: str, identities: list[str], transition, pre_specs=()):
         """In one WRITE transaction: run ``pre_specs`` (a chunk's upserts),
-        read each artifact's provenance, apply the pure ``transition``, write
-        the diffs, commit.
+        read each artifact's provenance links, apply the pure ``transition``,
+        link/unlink the ref entities for the difference, commit.
 
-        The read happens after the pre-specs, so a folded chunk sees the
-        artifacts it just upserted, and its stream is drained before any
-        further write is issued (TSV13).
+        The reads happen after the pre-specs, so a folded chunk sees the
+        artifacts it just upserted, and their streams are drained before
+        any further write is issued (TSV13). New links get positions after
+        the artifact's highest existing one, so order survives removals; a
+        retry after a rolled-back commit re-reads and cannot drift.
         """
         from typedb.driver import TransactionType
 
@@ -854,51 +972,73 @@ class TypeDBAdapter(GraphDBInterface):
             for query_text, given_rows in pre_specs:
                 tx.query(query_text, given_rows=given_rows).resolve()
             rows = [{"id": identity} for identity in identities]
-            documents = self._collect_answer(
-                tx.query(_provenance_read_query(kind), given_rows=rows).resolve()
-            )
-            inserts: dict[str, list[dict]] = {}
-            deletes: dict[str, list[dict]] = {}
-            json_rows: list[dict] = []
-            for document in documents:
-                identity = document["id"]
-                keys, run_refs, stored = self._decode_provenance(document)
+            current: dict[str, dict[str, list]] = {
+                identity: {"ref": [], "run": []} for identity in identities
+            }
+            for link in ("ref", "run"):
+                for entry in self._collect_answer(
+                    tx.query(_links_read_query(kind, link), given_rows=rows).resolve()
+                ):
+                    current[entry["id"]][link].append(entry)
+            inserts: dict[str, list[dict]] = {"ref": [], "run": []}
+            deletes: dict[str, list[dict]] = {"ref": [], "run": []}
+            for identity, links in current.items():
+                keys = self._ordered_links(links["ref"])
+                run_refs = self._ordered_links(links["run"])
                 columns = transition(keys, run_refs)
-                for field, attribute in _PROVENANCE_ATTRS.items():
-                    old, new = set(getattr(stored, field)), set(getattr(columns, field))
-                    for value in sorted(new - old):
-                        inserts.setdefault(attribute, []).append({"id": identity, "v": value})
-                    for value in sorted(old - new):
-                        deletes.setdefault(attribute, []).append({"id": identity, "v": value})
-                encoded = json.dumps(
-                    {"keys": columns.source_ref_keys, "run_refs": columns.source_run_refs}
-                )
-                if encoded != (document.get("pj") or ""):
-                    json_rows.append({"id": identity, "v": encoded})
-            for attribute, attr_rows in deletes.items():
-                tx.query(_attr_delete_query(kind, attribute), given_rows=attr_rows).resolve()
-            for attribute, attr_rows in inserts.items():
-                tx.query(_attr_insert_query(kind, attribute), given_rows=attr_rows).resolve()
-            if json_rows:
+                for link, old, new in (
+                    ("ref", links["ref"], columns.source_ref_keys),
+                    ("run", links["run"], columns.source_run_refs),
+                ):
+                    old_keys = {entry["k"] for entry in old}
+                    next_position = max((entry["p"] for entry in old), default=-1) + 1
+                    for value in new:
+                        if value not in old_keys:
+                            inserts[link].append({"id": identity, "v": value, "p": next_position})
+                            next_position += 1
+                    for value in sorted(old_keys - set(new)):
+                        deletes[link].append({"id": identity, "v": value})
+            changed = {
+                row["id"] for rows_ in (*deletes.values(), *inserts.values()) for row in rows_
+            }
+            for link, link_rows in deletes.items():
+                if link_rows:
+                    tx.query(_link_delete_query(kind, link), given_rows=link_rows).resolve()
+            for link, link_rows in inserts.items():
+                if link_rows:
+                    tx.query(_link_insert_query(kind, link), given_rows=link_rows).resolve()
+            if changed:
+                now = _now_ms()
                 tx.query(
-                    _attr_update_query(kind, "provenance-json"), given_rows=json_rows
+                    _touch_query(kind), given_rows=[{"id": i, "now": now} for i in sorted(changed)]
                 ).resolve()
             tx.commit()
 
-    async def _provenance_change(self, kind: str, identities, transition) -> None:
-        """Explicit attach/remove: apply ``transition`` to every artifact in
-        ``identities`` in serial chunk-sized transactions under the
-        provenance lock, each retried on commit conflicts with other
-        writers. The transition is idempotent, so a retried chunk cannot
-        double-record and committed chunks need no re-run."""
+    async def _provenance_change(self, kind: str, identities, attach: "_ProvenanceAttach") -> None:
+        """Explicit attach/remove: apply ``attach.transition`` to every
+        artifact in ``identities`` in concurrent chunk-sized transactions,
+        after putting any ref entities the change links to. Each chunk is
+        retried on commit conflicts with other writers; the transition is
+        idempotent, so a retried chunk cannot double-record."""
         identities = list(dict.fromkeys(str(identity) for identity in identities))
         if not identities:
             return
         await self._provision_database()
+        await self._ensure_provenance_refs(attach)
         size = self._chunk_rows
-        async with self._provenance_lock:
-            for start in range(0, len(identities), size):
-                await self._write_chunk([], (kind, identities[start : start + size], transition))
+        tasks = [
+            asyncio.create_task(
+                self._write_chunk([], (kind, identities[start : start + size], attach.transition))
+            )
+            for start in range(0, len(identities), size)
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     def _mutate_properties_sync(self, kind: str, identities, mutate) -> set[str]:
         """In one WRITE transaction: read properties-json for ``identities``
@@ -1127,8 +1267,8 @@ class TypeDBAdapter(GraphDBInterface):
             raise ValueError(f"pipeline_run_id must be a UUID, got {pipeline_run_id!r}") from error
 
     @classmethod
-    def _attach_transition_for_batch(cls, source_ref_key: str | None, pipeline_run_id):
-        """The provenance transition folded into add_nodes/add_edges, or None.
+    def _attach_for_batch(cls, source_ref_key: str | None, pipeline_run_id):
+        """The provenance attach folded into add_nodes/add_edges, or None.
 
         Delegates to cognee's ``provenance_after_attach`` (Model A: a key's run
         mapping is recorded only when the key is new to the artifact).
@@ -1142,7 +1282,7 @@ class TypeDBAdapter(GraphDBInterface):
                 "source_ref_key must be built with cognee's make_source_ref_key()"
             ) from error
         run = cls._validated_pipeline_run_id(pipeline_run_id)
-        return lambda keys, run_refs: provenance_after_attach(keys, run_refs, [source_ref_key], run)
+        return _ProvenanceAttach.for_keys([source_ref_key], run)
 
     async def add_nodes(
         self,
@@ -1158,7 +1298,7 @@ class TypeDBAdapter(GraphDBInterface):
         """
         if not nodes:
             return
-        transition = self._attach_transition_for_batch(source_ref_key, pipeline_run_id)
+        attach = self._attach_for_batch(source_ref_key, pipeline_run_id)
         now = _now_ms()
         rows: dict[str, dict[str, Any]] = {}
         for node in nodes:
@@ -1168,7 +1308,7 @@ class TypeDBAdapter(GraphDBInterface):
         await self._write_rows(
             _NODE_UPSERT,
             list(rows.values()),
-            provenance=("node", "id", transition) if transition else None,
+            provenance=("node", "id", attach) if attach else None,
         )
 
     async def extract_node(self, node_id: str):
@@ -1185,8 +1325,15 @@ class TypeDBAdapter(GraphDBInterface):
         if not node_ids:
             return
         rows = [{"id": str(node_id)} for node_id in node_ids]
-        # Edges first: deleting a player would leave a dangling edge.
-        await self._write_batch([(_DELETE_INCIDENT_EDGES, rows), (_DELETE_NODES, rows)])
+        # Provenance links and edges first: deleting a player leaves a
+        # dangling relation, whether that relation is an edge or a link.
+        link_queries = _link_deletes(_DELETE_LINKS_OF_INCIDENT_EDGES) + _link_deletes(
+            _DELETE_LINKS_OF_NODES
+        )
+        await self._write_batch(
+            [(query, rows) for query in link_queries]
+            + [(_DELETE_INCIDENT_EDGES, rows), (_DELETE_NODES, rows)]
+        )
 
     async def has_edge(self, source_id, target_id, relationship_name: str) -> bool:
         matched = await self.has_edges([(source_id, target_id, relationship_name)])
@@ -1242,7 +1389,7 @@ class TypeDBAdapter(GraphDBInterface):
         """
         if not edges:
             return
-        transition = self._attach_transition_for_batch(source_ref_key, pipeline_run_id)
+        attach = self._attach_for_batch(source_ref_key, pipeline_run_id)
         now = _now_ms()
         rows: dict[str, dict[str, Any]] = {}
         for source_id, target_id, relationship_name, properties in edges:
@@ -1275,7 +1422,7 @@ class TypeDBAdapter(GraphDBInterface):
             list(rows.values()),
             _SET_EDGE_CREATED_AT,
             "key",
-            provenance=("edge", "key", transition) if transition else None,
+            provenance=("edge", "key", attach) if attach else None,
         )
 
     async def get_edges(self, node_id: str):
@@ -1479,16 +1626,24 @@ class TypeDBAdapter(GraphDBInterface):
     ) -> None:
         if not node_ids:
             return
-        query = _REMOVE_LABELED_EDGES.format(anchor_role="target" if incoming else "source")
+        anchor_role = "target" if incoming else "source"
         rows = [{"id": str(node_id), "label": edge_label} for node_id in node_ids]
-        await self._write_batch([(query, rows)])
+        link_queries = _link_deletes(_DELETE_LINKS_OF_LABELED_EDGES, anchor_role=anchor_role)
+        await self._write_batch(
+            [(query, rows) for query in link_queries]
+            + [(_REMOVE_LABELED_EDGES.format(anchor_role=anchor_role), rows)]
+        )
 
     async def delete_graph(self):
         """Remove all nodes and edges (the schema is kept)."""
         await self._write_batch(
             [
+                "match $l isa sourced-from; delete $l;",
+                "match $l isa run-attached; delete $l;",
                 "match $e isa edge; delete $e;",
                 "match $n isa node; delete $n;",
+                "match $r isa source-ref; delete $r;",
+                "match $r isa run-ref; delete $r;",
             ]
         )
 
@@ -1777,39 +1932,35 @@ class TypeDBAdapter(GraphDBInterface):
     async def attach_node_source_refs(self, node_ids, source_ref_keys, pipeline_run_id=None):
         if not source_ref_keys:
             return
-        add_keys, run = list(source_ref_keys), self._validated_pipeline_run_id(pipeline_run_id)
+        run = self._validated_pipeline_run_id(pipeline_run_id)
         await self._provenance_change(
-            "node",
-            node_ids,
-            lambda keys, refs: provenance_after_attach(keys, refs, add_keys, run),
+            "node", node_ids, _ProvenanceAttach.for_keys(list(source_ref_keys), run)
         )
 
     async def attach_edge_source_refs(self, edges, source_ref_keys, pipeline_run_id=None):
         if not source_ref_keys:
             return
-        add_keys, run = list(source_ref_keys), self._validated_pipeline_run_id(pipeline_run_id)
+        run = self._validated_pipeline_run_id(pipeline_run_id)
         await self._provenance_change(
             "edge",
             [self._edge_identity_key(edge) for edge in edges],
-            lambda keys, refs: provenance_after_attach(keys, refs, add_keys, run),
+            _ProvenanceAttach.for_keys(list(source_ref_keys), run),
         )
 
     async def remove_node_source_refs(self, node_ids, source_ref_keys):
         if not source_ref_keys:
             return
-        remove_keys = list(source_ref_keys)
         await self._provenance_change(
-            "node", node_ids, lambda keys, refs: provenance_after_remove(keys, refs, remove_keys)
+            "node", node_ids, _ProvenanceAttach.removing(list(source_ref_keys))
         )
 
     async def remove_edge_source_refs(self, edges, source_ref_keys):
         if not source_ref_keys:
             return
-        remove_keys = list(source_ref_keys)
         await self._provenance_change(
             "edge",
             [self._edge_identity_key(edge) for edge in edges],
-            lambda keys, refs: provenance_after_remove(keys, refs, remove_keys),
+            _ProvenanceAttach.removing(list(source_ref_keys)),
         )
 
     async def delete_edge_triples(self, edges) -> None:
@@ -1817,10 +1968,13 @@ class TypeDBAdapter(GraphDBInterface):
         if not edges:
             return
         rows = [{"id": self._edge_identity_key(edge)} for edge in edges]
-        await self._write_batch([(_DELETE_EDGES_BY_KEY, rows)])
+        await self._write_batch(
+            [(query, rows) for query in _link_deletes(_DELETE_LINKS_OF_EDGES_BY_KEY)]
+            + [(_DELETE_EDGES_BY_KEY, rows)]
+        )
 
     def _provenance_columns_from_document(self, document: dict) -> ProvenanceColumns:
-        keys, run_refs, _stored = self._decode_provenance(document)
+        keys, run_refs = self._decode_provenance(document)
         return ProvenanceColumns(keys, derive_dataset_ids(keys), derive_run_ids(run_refs), run_refs)
 
     async def get_node_delete_data(self, node_ids) -> dict[str, NodeDeleteData]:
@@ -1879,33 +2033,33 @@ class TypeDBAdapter(GraphDBInterface):
             )
         return result
 
-    async def _nodes_by_attribute(self, attribute: str, value: str) -> list[dict]:
-        query = _NODES_BY_ATTR.format(attribute=attribute)
-        return (await self._read_batch([(query, [{"v": value}])]))[0]
-
-    async def _edges_by_attribute(self, attribute: str, value: str) -> list[dict]:
-        query = _EDGES_BY_ATTR.format(attribute=attribute)
-        return (await self._read_batch([(query, [{"v": value}])]))[0]
+    async def _artifacts_by_ref(self, kind: str, link: str, by_derived: bool, value: str):
+        """Artifact documents linked to a ref entity, one per artifact (an
+        artifact linked to several refs of one dataset appears once)."""
+        query = _artifacts_by_ref_query(kind, link, by_derived)
+        documents = (await self._read_batch([(query, [{"v": value}])]))[0]
+        unique: dict = {}
+        for document in documents:
+            identity = document["id"] if kind == "node" else self._edge_identity_of(document)
+            unique.setdefault(identity, document)
+        return unique
 
     @staticmethod
     def _edge_identity_of(document: dict) -> EdgeIdentity:
         return EdgeIdentity(document["source"], document["target"], document["relationship_name"])
 
     async def find_nodes_by_source_ref(self, source_ref_key: str) -> list[str]:
-        return [
-            doc["id"] for doc in await self._nodes_by_attribute("source-ref-key", source_ref_key)
-        ]
+        return list(await self._artifacts_by_ref("node", "ref", False, source_ref_key))
 
     async def find_edges_by_source_ref(self, source_ref_key: str) -> list[EdgeIdentity]:
-        documents = await self._edges_by_attribute("source-ref-key", source_ref_key)
-        return [self._edge_identity_of(doc) for doc in documents]
+        return list(await self._artifacts_by_ref("edge", "ref", False, source_ref_key))
 
     def _keys_owned_by_dataset(self, document: dict, dataset_id: str) -> list[str]:
-        keys, _refs, _stored = self._decode_provenance(document)
+        keys, _refs = self._decode_provenance(document)
         return [key for key in keys if str(get_dataset_id_from_source_ref_key(key)) == dataset_id]
 
     def _keys_contributed_by_run(self, document: dict, pipeline_run_id: str) -> list[str]:
-        _keys, run_refs, _stored = self._decode_provenance(document)
+        _keys, run_refs = self._decode_provenance(document)
         return [
             get_source_ref_key_from_source_run_ref(ref)
             for ref in run_refs
@@ -1913,41 +2067,45 @@ class TypeDBAdapter(GraphDBInterface):
         ]
 
     async def find_node_source_refs_by_dataset(self, dataset_id: str) -> dict[str, list[str]]:
+        found = await self._artifacts_by_ref("node", "ref", True, dataset_id)
         result = {}
-        for doc in await self._nodes_by_attribute("source-dataset-id", dataset_id):
+        for identity, doc in found.items():
             owned = self._keys_owned_by_dataset(doc, dataset_id)
             if owned:
-                result[doc["id"]] = owned
+                result[identity] = owned
         return result
 
     async def find_edge_source_refs_by_dataset(
         self, dataset_id: str
     ) -> dict[EdgeIdentity, list[str]]:
+        found = await self._artifacts_by_ref("edge", "ref", True, dataset_id)
         result = {}
-        for doc in await self._edges_by_attribute("source-dataset-id", dataset_id):
+        for identity, doc in found.items():
             owned = self._keys_owned_by_dataset(doc, dataset_id)
             if owned:
-                result[self._edge_identity_of(doc)] = owned
+                result[identity] = owned
         return result
 
     async def find_node_source_refs_by_pipeline_run(
         self, pipeline_run_id: str
     ) -> dict[str, list[str]]:
+        found = await self._artifacts_by_ref("node", "run", True, pipeline_run_id)
         result = {}
-        for doc in await self._nodes_by_attribute("source-run-id", pipeline_run_id):
+        for identity, doc in found.items():
             contributed = self._keys_contributed_by_run(doc, pipeline_run_id)
             if contributed:
-                result[doc["id"]] = contributed
+                result[identity] = contributed
         return result
 
     async def find_edge_source_refs_by_pipeline_run(
         self, pipeline_run_id: str
     ) -> dict[EdgeIdentity, list[str]]:
+        found = await self._artifacts_by_ref("edge", "run", True, pipeline_run_id)
         result = {}
-        for doc in await self._edges_by_attribute("source-run-id", pipeline_run_id):
+        for identity, doc in found.items():
             contributed = self._keys_contributed_by_run(doc, pipeline_run_id)
             if contributed:
-                result[self._edge_identity_of(doc)] = contributed
+                result[identity] = contributed
         return result
 
     async def set_graph_metadata(self, metadata: dict[str, str]) -> None:

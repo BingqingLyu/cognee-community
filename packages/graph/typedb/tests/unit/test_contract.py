@@ -131,35 +131,37 @@ async def test_provenance_fold_validates_source_ref_key_offline():
     """A malformed source_ref_key is rejected before any server contact."""
     from uuid import uuid4
 
-    from cognee.infrastructure.databases.provenance import make_source_ref_key
+    from cognee.infrastructure.databases.provenance import (
+        make_source_ref_key,
+        make_source_run_ref,
+    )
     from cognee.infrastructure.databases.provenance.source_ref_state import (
         provenance_after_attach,
     )
 
     from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
 
-    assert TypeDBAdapter._attach_transition_for_batch(None, "run") is None
+    assert TypeDBAdapter._attach_for_batch(None, "run") is None
     with pytest.raises(ValueError):
-        TypeDBAdapter._attach_transition_for_batch("ds:test", str(uuid4()))
+        TypeDBAdapter._attach_for_batch("ds:test", str(uuid4()))
     with pytest.raises(ValueError):
-        TypeDBAdapter._attach_transition_for_batch(make_source_ref_key(uuid4(), uuid4()), "run-1")
+        TypeDBAdapter._attach_for_batch(make_source_ref_key(uuid4(), uuid4()), "run-1")
 
     key, run = make_source_ref_key(uuid4(), uuid4()), str(uuid4())
-    transition = TypeDBAdapter._attach_transition_for_batch(key, run)
-    assert transition([], []) == provenance_after_attach([], [], [key], run)
+    attach = TypeDBAdapter._attach_for_batch(key, run)
+    assert attach.transition([], []) == provenance_after_attach([], [], [key], run)
+    assert attach.keys == [key]
+    assert attach.run_refs == [make_source_run_ref(run, key)]
 
 
-def test_decode_provenance_prefers_ordered_json_over_set_index():
+def test_decode_provenance_orders_links_by_position():
     from cognee_community_graph_adapter_typedb.typedb_adapter import TypeDBAdapter
 
-    keys, refs, stored = TypeDBAdapter._decode_provenance(
-        {"pj": '{"keys": ["b", "a"], "run_refs": ["r"]}', "keys": ["a", "b"], "runrefs": ["r"]}
+    keys, refs = TypeDBAdapter._decode_provenance(
+        {"keys": [{"k": "a", "p": 5}, {"k": "b", "p": 2}], "runs": [{"k": "r", "p": 0}]}
     )
     assert (keys, refs) == (["b", "a"], ["r"])
-    assert stored.source_ref_keys == ["a", "b"]
-
-    keys, refs, _ = TypeDBAdapter._decode_provenance({"pj": "not json", "keys": ["a"]})
-    assert (keys, refs) == (["a"], [])
+    assert TypeDBAdapter._decode_provenance({}) == ([], [])
 
 
 def test_tls_config_from_environment():

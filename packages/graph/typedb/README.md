@@ -215,23 +215,30 @@ Cognee's graph-native provenance (the `attach_*_source_refs` /
 `find_*_by_*` / `get_*_delete_data` family) is implemented with cognee's own
 transition functions, so attach/remove semantics match the built-in adapters
 exactly, including "Model A": a pipeline run is recorded against a source
-ref only when that ref is newly attached. Each node and edge stores the
-ordered provenance record in `provenance-json` (the canonical copy, since
-TypeDB's multi-valued attributes are unordered and cognee asserts attach
-order) and mirrors it into four multi-valued lookup attributes
-(`source-ref-key`, `source-dataset-id`, `source-run-id`, `source-run-ref`).
-`add_nodes` / `add_edges` fold the attach into each chunk's transaction
-(upsert, read the current record, apply the transition, write the diff,
-commit), so no node or edge is ever visible without its provenance, which
-cognee's rollback and delete planners rely on. Chunks that carry provenance
-run one at a time per adapter: TypeDB conflicts concurrent inserts of
-ownership of the same string value longer than 16 characters, and every
-row of a batch owns the same source-ref key, dataset id and run id (see
-`benchmarks/README.md`; serial 100-row chunks are the fastest shape that
-keeps the fold). Explicit attach/remove calls use the same serialized path.
-Writers in other processes or adapter instances still conflict at commit;
-those conflicts are retried for up to 30 seconds with capped, jittered
-backoff, and a warning is logged once the contention lasts ten rounds.
+ref only when that ref is newly attached. The record is relational: one
+`source-ref` entity per source ref key (owning the key and its dataset id)
+and one `run-ref` entity per run ref (owning the ref and its run id), linked
+to their artifacts by the `sourced-from` and `run-attached` relations. Each
+link carries a `position`, the attach order, because cognee asserts it and
+TypeDB's multi-valued attributes are unordered. `find_nodes_by_source_ref`
+and friends traverse those links; the dataset and pipeline-run lookups then
+filter each artifact's links.
+
+`add_nodes` / `add_edges` put the batch's ref entities first, then fold the
+attach into each chunk's transaction (upsert, read the links, apply the
+transition, link or unlink for the difference, commit), so no node or edge
+is ever visible without its provenance, which cognee's rollback and delete
+planners rely on. Because artifacts only link to a ref rather than owning
+its key string, provenance-carrying chunks run concurrently like any other
+write; TypeDB conflicts concurrent inserts of ownership of the same long
+string value, which is why the keys live on the ref entities (see
+`benchmarks/README.md`). Every provenance change also bumps the artifact's
+`updated-at`, so two writers changing one artifact conflict at commit and
+the loser re-reads; those conflicts are retried for up to 30 seconds with
+capped, jittered backoff, and a warning is logged once the contention lasts
+ten rounds. Every delete path removes an artifact's links before the
+artifact, since TypeDB keeps a relation whose role player was deleted; ref
+entities themselves are kept (they are small and re-used).
 
 Feedback weights (`feedback_weight`) and truth state (`truth_alignment`,
 `truth_epoch`) live inside `properties-json`, where `CogneeGraph` reads them
@@ -240,9 +247,9 @@ from the projected properties; edge weights are addressed by cognee's
 
 The schema define is idempotent and re-applied on every fresh adapter, so
 additive schema changes reach existing databases; incompatible changes need
-a fresh database. Artifacts stamped before `provenance-json` existed still
-report their source-ref keys from the lookup attributes, but not the
-run-to-key pairing (only `source-run-id` was stored then).
+a fresh database. Databases written by earlier development versions of this
+adapter (provenance stored as attributes on the artifacts) need a fresh
+database: the relational provenance model does not read the old attributes.
 
 ### Limitations
 

@@ -58,15 +58,16 @@ async def test_add_nodes_with_duplicate_ids_in_one_batch(adapter):
 
 
 async def test_provenance_stamps_accumulate_and_survive_unstamped_upserts(seeded):
-    """The indexed provenance attributes are @card(0..): each stamped write
-    adds its run ref, and a provenance-less re-add leaves existing stamps alone."""
+    """Each stamped write links the node to its run ref entity, and a
+    provenance-less re-add leaves the existing links alone."""
     adapter = seeded.adapter
     ml = seeded.concepts["ml"]
 
     async def stamps():
         rows = await adapter.query(
-            "given $id: string; match $n isa node, has node-id == $id,"
-            " has source-run-ref $r; select $r;",
+            "given $id: string; match $n isa node, has node-id == $id;"
+            " $l isa run-attached, links (artifact: $n, run: $rr);"
+            " $rr has source-run-ref $r; select $r;",
             {"id": seeded.ml},
         )
         return {row["r"] for row in rows}
