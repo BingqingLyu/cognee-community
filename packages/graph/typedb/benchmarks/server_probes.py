@@ -17,7 +17,7 @@ import uuid
 from typedb.driver import Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDB
 
 from cognee_community_graph_adapter_typedb import TypeDBAdapter
-from cognee_community_graph_adapter_typedb.typedb_adapter import _NODE_UPSERT, _now_ms
+from cognee_community_graph_adapter_typedb.queries import _NODE_UPSERT, _now_ms
 
 PROBE_SCHEMA = "define attribute k value string; entity thing, owns k @key;"
 

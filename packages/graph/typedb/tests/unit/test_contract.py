@@ -93,7 +93,7 @@ def test_dataset_database_name_derivation_and_validation():
 
 
 def test_edge_key_is_unambiguous_for_ids_containing_separators():
-    from cognee_community_graph_adapter_typedb.typedb_adapter import _edge_key
+    from cognee_community_graph_adapter_typedb.queries import _edge_key
 
     assert _edge_key("a|b", "c", "r") != _edge_key("a", "b|c", "r")
     assert _edge_key("a", "b", "r") == _edge_key("a", "b", "r")

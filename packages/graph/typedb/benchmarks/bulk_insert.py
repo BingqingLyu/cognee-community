@@ -37,7 +37,7 @@ from cognee.infrastructure.engine import DataPoint
 from cognee.modules.engine.utils import generate_edge_object_id
 
 from cognee_community_graph_adapter_typedb import TypeDBAdapter
-from cognee_community_graph_adapter_typedb.typedb_adapter import (
+from cognee_community_graph_adapter_typedb.queries import (
     _EDGE_UPSERT,
     _NODE_UPSERT,
     _SET_EDGE_CREATED_AT,

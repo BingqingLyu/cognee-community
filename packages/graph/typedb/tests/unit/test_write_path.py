@@ -4,11 +4,11 @@ import asyncio
 
 import pytest
 
+from cognee_community_graph_adapter_typedb.provenance import _ProvenanceAttach
 from cognee_community_graph_adapter_typedb.typedb_adapter import (
     WRITE_CHUNK_ROWS,
     WRITE_CONCURRENCY,
     TypeDBAdapter,
-    _ProvenanceAttach,
 )
 
 STC2 = "\n[STC2] Commit in database 'x' failed with isolation conflict: ..."

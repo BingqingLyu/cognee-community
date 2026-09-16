@@ -1,48 +1,23 @@
 """TypeDB graph database adapter for cognee.
 
-Maps cognee's property-graph model onto the reified TypeDB schema in
-``schema.tql``: one ``node`` entity type and one ``edge`` relation type
-(roles ``source``/``target``). Cognee's dynamic node labels and relationship names
-are stored as attributes; the full property payload is serialized into the
-``properties-json`` attribute, which is the canonical record — the promoted
-attributes (``node-type``, ``name``) exist only as query accelerators, mirror
-the JSON, and are always written together with it. Edges carry an explicit
-``edge-key`` (a JSON ``[source, target, relationship]`` triple) as their
-identity and ``edge-object-id`` (cognee's deterministic feedback id).
+Cognee's property graph is stored in the reified schema in ``schema.tql``:
+one ``node`` entity type and one ``edge`` relation type (roles ``source`` /
+``target``). Node labels and relationship names are attributes; the full
+property payload is the ``properties-json`` attribute, which is the canonical
+record, and the promoted ``node-type`` / ``name`` attributes mirror it as
+query accelerators. An edge's identity is its ``edge-key`` (a JSON
+``[source, target, relationship]`` triple); ``edge-object-id`` is cognee's
+feedback id. Timestamps are epoch milliseconds: a node's ``created-at``
+mirrors its payload, an edge's is set on first write, ``updated-at`` is the
+write time. Feedback weights and truth state live inside ``properties-json``.
+Provenance is in ``provenance.py``, the TypeQL in ``queries.py``.
 
-Provenance (cognee's ``attach_*_source_refs`` / ``find_*_by_*`` /
-``get_*_delete_data`` family) delegates its state transitions to cognee's
-``provenance_after_attach`` / ``provenance_after_remove``, so the semantics
-match the built-in adapters. Storage is relational: one ``source-ref``
-entity per source ref key and one ``run-ref`` entity per run ref, linked to
-their artifacts by ``sourced-from`` / ``run-attached`` relations whose
-``position`` attribute records the attach order. ``add_nodes`` /
-``add_edges`` put the batch's ref entities first, then fold the attach into
-each chunk's transaction (upsert, read the links, apply the transition, link
-or unlink the difference, commit), so an artifact is never visible without
-its provenance. Every provenance change also updates the artifact's
-``updated-at``, which makes concurrent changes to one artifact conflict at
-commit so that the loser re-reads. Delete paths remove an artifact's links
-before the artifact, because TypeDB keeps a relation whose role player was
-deleted.
-
-A node's ``created-at`` mirrors its DataPoint payload's ``created_at``; an
-edge's is set once on first write; ``updated-at`` is the write time (all
-epoch ms). Feedback weights and truth state live inside ``properties-json``.
-
-Values reach the server through the TypeQL ``given`` stage (driver
-``given_rows``), never by string interpolation, so queries are compiled once
-per template and are injection-safe by construction.
-
-The TypeDB Python driver is synchronous (the async Rust core stops at the
-FFI boundary), while cognee's ``GraphDBInterface`` is fully async. Driver
-work runs on a small dedicated thread pool. Batch writes (``add_nodes`` /
-``add_edges``) run as chunked transactions of ``WRITE_CHUNK_ROWS`` rows with
-``WRITE_CONCURRENCY`` in flight, so a batch is not atomic: on failure,
-committed chunks stay committed and pending ones are cancelled — the same
-property the sibling adapters' batches have. Commit isolation conflicts
-(``[STC2]``) are retried on every write path; TypeDB rolls a failed commit
-back entirely, so a retry never duplicates work.
+The TypeDB Python driver is synchronous, so driver work runs on a small
+dedicated thread pool behind cognee's async interface. Batch writes run as
+chunked transactions of ``WRITE_CHUNK_ROWS`` rows with ``WRITE_CONCURRENCY``
+in flight, so a batch is not atomic (as with the sibling adapters). Commit
+isolation conflicts are retried on every write path; a failed commit rolls
+the whole transaction back, so a retry never duplicates work.
 """
 
 import asyncio
@@ -50,42 +25,57 @@ import contextlib
 import json
 import os
 import random
-import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from itertools import product
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 from cognee.exceptions import CogneeValidationError
-from cognee.infrastructure.databases.graph.graph_db_interface import (
-    GraphDBInterface,
-)
-from cognee.infrastructure.databases.provenance import (
-    EdgeDeleteData,
-    EdgeIdentity,
-    NodeDeleteData,
-    get_dataset_id_from_source_ref_key,
-    get_pipeline_run_id_from_source_run_ref,
-    get_source_ref_key_from_source_run_ref,
-    make_source_run_ref,
-)
-from cognee.infrastructure.databases.provenance.source_ref_state import (
-    ProvenanceColumns,
-    coerce_run_uuid,
-    derive_dataset_ids,
-    derive_run_ids,
-    provenance_after_attach,
-    provenance_after_remove,
-)
+from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInterface
 from cognee.infrastructure.engine import DataPoint
 from cognee.modules.engine.utils import generate_edge_object_id
 from cognee.modules.retrieval.exceptions import SearchTypeNotSupported
 from cognee.modules.storage.utils import JSONEncoder
 from cognee.shared.logging_utils import get_logger
+
+from .provenance import ProvenanceMixin
+from .queries import (
+    _ALL_EDGE_ENDPOINTS,
+    _ALL_EDGES,
+    _ALL_NODE_IDS,
+    _ALL_NODES,
+    _COMMENT_RE,
+    _DELETE_INCIDENT_EDGES,
+    _DELETE_LINKS_OF_INCIDENT_EDGES,
+    _DELETE_LINKS_OF_LABELED_EDGES,
+    _DELETE_LINKS_OF_NODES,
+    _DELETE_NODES,
+    _EDGE_UPSERT,
+    _EDGES_BY_OBJECT_ID,
+    _FETCH_NODES,
+    _HAS_EDGES,
+    _INCIDENT_EDGES_IN,
+    _INCIDENT_EDGES_OUT,
+    _ISOLATED_NODE_IDS,
+    _NEIGHBOURS,
+    _NODE_UPSERT,
+    _PRE_LINK_PROVENANCE_ATTRIBUTES,
+    _PROMOTED_FILTER_ATTRS,
+    _REMOVE_LABELED_EDGES,
+    _SCHEMA_KEYWORDS,
+    _SET_EDGE_CREATED_AT,
+    _STRING_LITERAL_RE,
+    _TRIPLETS_BATCH,
+    _WRITE_STAGE_RE,
+    COGNEE_SCHEMA,
+    _edge_key,
+    _link_deletes,
+    _now_ms,
+    _properties_read_query,
+    _properties_write_query,
+)
 
 logger = get_logger("TypeDBAdapter")
 
@@ -98,202 +88,6 @@ DEFAULT_DATABASE = "cognee"
 # has no provider-specific fields.
 TLS_ENV = "TYPEDB_TLS"
 TLS_ROOT_CA_ENV = "TYPEDB_TLS_ROOT_CA"
-
-# The schema is the single source of truth in schema.tql (shipped with the
-# package). The define is idempotent and re-run on every fresh adapter, so
-# additive schema evolution reaches existing databases; incompatible changes
-# require a fresh database.
-COGNEE_SCHEMA = (Path(__file__).parent / "schema.tql").read_text(encoding="utf-8")
-
-_SCHEMA_KEYWORDS = ("define", "undefine", "redefine")
-# Word-boundary match, applied only after string literals and comments are
-# stripped, so reads over e.g. `updated-at` or values like "deleted" are not
-# misclassified as writes.
-_WRITE_STAGE_RE = re.compile(r"\b(insert|put|update|delete)\b")
-_STRING_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
-_COMMENT_RE = re.compile(r"#[^\n]*")
-
-# --- given-parameterized query templates -----------------------------------
-
-
-_NODE_UPSERT = """
-given $id: string, $type: string, $name: string, $props: string, $created: integer, $now: integer;
-put $n isa node, has node-id == $id;
-update
-  $n has node-type == $type;
-  $n has name == $name;
-  $n has properties-json == $props;
-  $n has created-at == $created;
-  $n has updated-at == $now;
-"""
-
-_EDGE_UPSERT = """
-given $key: string, $sid: string, $tid: string, $rel: string, $eoid: string, $props: string,
-  $now: integer;
-match
-  $s isa node, has node-id == $sid;
-  $t isa node, has node-id == $tid;
-put
-  $e isa edge, links (source: $s, target: $t),
-    has edge-key == $key, has relationship-name == $rel;
-update
-  $e has edge-object-id == $eoid;
-  $e has properties-json == $props;
-  $e has updated-at == $now;
-"""
-
-_SET_EDGE_CREATED_AT = """
-given $key: string, $now: integer;
-match $e isa edge, has edge-key == $key; not { $e has created-at $c; };
-insert $e has created-at == $now;
-"""
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _edge_key(source_id: str, target_id: str, relationship_name: str) -> str:
-    """Edge identity as a JSON-encoded triple, so ids containing '|' cannot collide."""
-    return json.dumps([source_id, target_id, relationship_name], separators=(",", ":"))
-
-
-_FETCH_NODES = """
-given $id: string;
-match $n isa node, has node-id == $id;
-fetch { "node": { $n.* } };
-"""
-
-_HAS_EDGES = """
-given $key: string, $sid: string, $tid: string, $rel: string;
-match $e isa edge, has edge-key == $key;
-fetch { "source": $sid, "target": $tid, "relationship_name": $rel };
-"""
-
-_DELETE_INCIDENT_EDGES = """
-given $id: string;
-match $n isa node, has node-id == $id; $e isa edge, links ($n);
-delete $e;
-"""
-
-_DELETE_NODES = """
-given $id: string;
-match $n isa node, has node-id == $id;
-delete $n;
-"""
-
-# Provenance links of artifacts about to be deleted (TypeDB does not remove a
-# relation when a role player is deleted). One template per artifact
-# selection, formatted with the link relation type.
-_DELETE_LINKS_OF_NODES = """
-given $id: string;
-match $n isa node, has node-id == $id; $l isa {link}, links (artifact: $n);
-delete $l;
-"""
-_DELETE_LINKS_OF_INCIDENT_EDGES = """
-given $id: string;
-match $n isa node, has node-id == $id; $e isa edge, links ($n); $l isa {link}, links (artifact: $e);
-delete $l;
-"""
-_DELETE_LINKS_OF_EDGES_BY_KEY = """
-given $id: string;
-match $e isa edge, has edge-key == $id; $l isa {link}, links (artifact: $e);
-delete $l;
-"""
-_DELETE_LINKS_OF_LABELED_EDGES = """
-given $id: string, $label: string;
-match
-  $n isa node, has node-id == $id;
-  $e isa edge, links ({anchor_role}: $n), has relationship-name == $label;
-  $l isa {link}, links (artifact: $e);
-delete $l;
-"""
-_LINK_TYPES = ("sourced-from", "run-attached")
-# Attributes earlier versions of this adapter put on node/edge for provenance.
-_PRE_LINK_PROVENANCE_ATTRIBUTES = frozenset(
-    {"source-ref-key", "source-dataset-id", "source-run-id", "source-run-ref", "provenance-json"}
-)
-
-
-def _link_deletes(template: str, **fields) -> list[str]:
-    """The two link-deletion statements (one per link type) for a template."""
-    return [template.format(link=link, **fields) for link in _LINK_TYPES]
-
-
-# Incident edges of an anchor node, one query per role the anchor plays (an
-# `or` over the role is 12-18x slower than two directional queries — see
-# benchmarks/README.md). Both produce the same document shape; self-loops
-# appear in both and consumers de-duplicate by (source, target, rel). Only
-# the far endpoint's document is fetched — the anchor is always already
-# known to every consumer, and hub nodes would otherwise ship their payload
-# once per incident edge.
-_INCIDENT_EDGES_OUT = """
-given $id: string;
-match
-  $n isa node, has node-id == $id;
-  $e isa edge, links (source: $n, target: $m);
-  $m has node-id $mid;
-  $e has relationship-name $rel;
-fetch {
-  "source": $id, "target": $mid, "relationship_name": $rel,
-  "edge": { $e.* }, "source_node": { "node-id": $id }, "target_node": { $m.* }
-};
-"""
-
-_INCIDENT_EDGES_IN = """
-given $id: string;
-match
-  $n isa node, has node-id == $id;
-  $e isa edge, links (source: $m, target: $n);
-  $m has node-id $mid;
-  $e has relationship-name $rel;
-fetch {
-  "source": $mid, "target": $id, "relationship_name": $rel,
-  "edge": { $e.* }, "source_node": { $m.* }, "target_node": { "node-id": $id }
-};
-"""
-
-# incoming=True: neighbours pointing at the node; incoming=False: pointed to.
-_NEIGHBOURS = """
-given $id: string{label_decl};
-match
-  $n isa node, has node-id == $id;
-  $e isa edge, links ({anchor_role}: $n, {neighbour_role}: $m){label_constraint};
-  $e has relationship-name $rel;
-fetch {{ "neighbour": {{ $m.* }}, "relationship_name": $rel, "node": {{ $n.* }} }};
-"""
-
-_REMOVE_LABELED_EDGES = """
-given $id: string, $label: string;
-match
-  $n isa node, has node-id == $id;
-  $e isa edge, links ({anchor_role}: $n), has relationship-name == $label;
-delete $e;
-"""
-
-_ALL_NODE_IDS = "match $n isa node, has node-id $id; select $id;"
-_ALL_EDGE_ENDPOINTS = """
-match
-  $e isa edge, links (source: $s, target: $t);
-  $s has node-id $sid;
-  $t has node-id $tid;
-select $sid, $tid;
-"""
-_ALL_NODES = 'match $n isa node; fetch { "node": { $n.* } };'
-_ALL_EDGES = """
-match
-  $e isa edge, links (source: $s, target: $t);
-  $s has node-id $sid;
-  $t has node-id $tid;
-  $e has relationship-name $rel;
-fetch { "source": $sid, "target": $tid, "relationship_name": $rel, "edge": { $e.* } };
-"""
-_ISOLATED_NODE_IDS = """
-match
-  $n isa node, has node-id $id;
-  not { $e isa edge, links ($n); };
-select $id;
-"""
 
 # Batch writes are split into transactions of this many rows, with up to
 # WRITE_CONCURRENCY transactions in flight (both tuned in benchmarks/README.md).
@@ -324,219 +118,7 @@ def _get_env_variable_as_positive_int(name: str, default: int, environ=os.enviro
     return value
 
 
-# --- provenance, weights, metadata, triplets -------------------------------
-
-# Artifact match fragments: bind $x (node or edge) from a given $id.
-_MATCH_BY_ID = {
-    "node": "$x isa node, has node-id == $id;",
-    "edge": "$x isa edge, has edge-key == $id;",
-}
-# Provenance link kinds: (ref entity type, its key attribute, its derived-id
-# attribute, link relation type, the ref's role in it).
-_PROVENANCE_LINKS = {
-    "ref": ("source-ref", "source-ref-key", "source-dataset-id", "sourced-from", "ref"),
-    "run": ("run-ref", "source-run-ref", "source-run-id", "run-attached", "run"),
-}
-
-# Ref entities are put once per batch, before the chunks that link to them.
-_PUT_SOURCE_REF = """
-given $k: string, $d: string;
-put $r isa source-ref, has source-ref-key == $k;
-update $r has source-dataset-id == $d;
-"""
-_PUT_RUN_REF = """
-given $k: string, $run: string;
-put $r isa run-ref, has source-run-ref == $k;
-update $r has source-run-id == $run;
-"""
-
-
-def _links_read_query(kind: str, link: str) -> str:
-    """One row per provenance link of each given artifact: its position and
-    the ref's key. Keep the per-link fetch form (see benchmarks/README.md
-    for the server behaviour a join-based select triggers)."""
-    _entity, key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
-    return (
-        "given $id: string;\n"
-        f"match {_MATCH_BY_ID[kind]} $l isa {relation}, links (artifact: $x, {role}: $r);\n"
-        f'fetch {{ "id": $id, "p": $l.position, "k": $r.{key_attr} }};'
-    )
-
-
-def _links_fetch_list(var: str, link: str) -> str:
-    """A fetch sub-query listing ``var``'s links of one kind (key + position)."""
-    _entity, key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
-    # Own variable names: the enclosing match may bind $l / $r to other types.
-    return (
-        f"[ match $pl_{link} isa {relation}, links (artifact: {var}, {role}: $pr_{link});"
-        f' fetch {{ "k": $pr_{link}.{key_attr}, "p": $pl_{link}.position }}; ]'
-    )
-
-
-def _ref_lookup_query(link: str) -> str:
-    """Resolve ref entities by key, once per transaction. Links are then
-    written against the entity's IID: a key lookup per row would scan, since
-    every key of a dataset shares a long prefix (benchmarks/README.md)."""
-    entity, key_attr, _derived, _relation, _role = _PROVENANCE_LINKS[link]
-    return f"given $v: string;\nmatch $r isa {entity}, has {key_attr} == $v;\nselect $v, $r;"
-
-
-_IID_RE = re.compile(r"^0x[0-9a-f]+$")
-
-
-def _iid_literal(iid: str) -> str:
-    """An IID is the one value that goes into query text (the `given` stage
-    cannot bind one); validate it so nothing else ever can."""
-    if not _IID_RE.fullmatch(iid):
-        raise ValueError(f"not a TypeDB IID: {iid!r}")
-    return iid
-
-
-def _link_insert_query(kind: str, link: str, ref_iid: str) -> str:
-    entity, _key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
-    return (
-        "given $id: string, $p: integer;\n"
-        f"match {_MATCH_BY_ID[kind]} $r isa {entity}, iid {_iid_literal(ref_iid)};\n"
-        # insert, not put: the preceding read established the link is absent.
-        f"insert (artifact: $x, {role}: $r) isa {relation}, has position == $p;"
-    )
-
-
-def _touch_query(kind: str) -> str:
-    """Update the artifact's updated-at. Every provenance change does this
-    for the artifacts it changed, so that concurrent changes to one artifact
-    conflict at commit and the loser re-reads."""
-    match = _MATCH_BY_ID[kind]
-    return f"given $id: string, $now: integer;\nmatch {match}\nupdate $x has updated-at == $now;"
-
-
-def _link_delete_query(kind: str, link: str, ref_iid: str) -> str:
-    entity, _key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
-    return (
-        "given $id: string;\n"
-        f"match {_MATCH_BY_ID[kind]} $r isa {entity}, iid {_iid_literal(ref_iid)};"
-        f" $l isa {relation}, links (artifact: $x, {role}: $r);\n"
-        "delete $l;"
-    )
-
-
-def _artifacts_by_ref_query(kind: str, link: str, by_derived: bool) -> str:
-    """Artifacts linked to a ref entity, selected by its key or its derived id,
-    with each artifact's full provenance links."""
-    entity, key_attr, derived_attr, relation, role = _PROVENANCE_LINKS[link]
-    attribute = derived_attr if by_derived else key_attr
-    if kind == "node":
-        return (
-            "given $v: string;\n"
-            f"match $r isa {entity}, has {attribute} == $v;"
-            f" $l isa {relation}, links (artifact: $n, {role}: $r); $n isa node, has node-id $id;\n"
-            f'fetch {{ "id": $id, "keys": {_links_fetch_list("$n", "ref")},'
-            f' "runs": {_links_fetch_list("$n", "run")} }};'
-        )
-    return (
-        "given $v: string;\n"
-        f"match $r isa {entity}, has {attribute} == $v;"
-        f" $l isa {relation}, links (artifact: $e, {role}: $r);"
-        " $e isa edge, links (source: $s, target: $t);"
-        " $s has node-id $sid; $t has node-id $tid; $e has relationship-name $rel;\n"
-        'fetch { "source": $sid, "target": $tid, "relationship_name": $rel,'
-        f' "keys": {_links_fetch_list("$e", "ref")}, "runs": {_links_fetch_list("$e", "run")} }};'
-    )
-
-
-def _properties_write_query(kind: str) -> str:
-    match = _MATCH_BY_ID[kind]
-    return (
-        f"given $id: string, $v: string, $now: integer;\nmatch {match}\n"
-        "update $x has properties-json == $v; $x has updated-at == $now;"
-    )
-
-
-def _properties_read_query(kind: str, all_artifacts: bool) -> str:
-    if all_artifacts:
-        key_attr = "node-id" if kind == "node" else "edge-key"
-        artifact = "node" if kind == "node" else "edge"
-        return (
-            f"match $x isa {artifact}, has {key_attr} $id, has properties-json $p;\n"
-            'fetch { "id": $id, "p": $p };'
-        )
-    return (
-        "given $id: string;\n"
-        f"match {_MATCH_BY_ID[kind]} $x has properties-json $p;\n"
-        'fetch { "id": $id, "p": $p };'
-    )
-
-
-_NODE_DELETE_DATA = f"""
-given $id: string;
-match $n isa node, has node-id == $id;
-fetch {{ "node": {{ $n.* }}, "keys": {_links_fetch_list("$n", "ref")},
-        "runs": {_links_fetch_list("$n", "run")} }};
-"""
-_EDGE_DELETE_DATA = f"""
-given $id: string;
-match
-  $e isa edge, has edge-key == $id, links (source: $s, target: $t);
-  $s has node-id $sid; $t has node-id $tid; $e has relationship-name $rel;
-fetch {{ "source": $sid, "target": $tid, "relationship_name": $rel, "edge": {{ $e.* }},
-        "keys": {_links_fetch_list("$e", "ref")}, "runs": {_links_fetch_list("$e", "run")} }};
-"""
-_DELETE_EDGES_BY_KEY = """
-given $id: string;
-match $e isa edge, has edge-key == $id;
-delete $e;
-"""
-_EDGES_BY_OBJECT_ID = """
-given $v: string;
-match $e isa edge, has edge-object-id == $v, has edge-key $k, has properties-json $p;
-fetch { "eoid": $v, "key": $k, "p": $p };
-"""
-_METADATA_SET = """
-given $k: string, $v: string;
-put $m isa graph-metadata, has metadata-key == $k;
-update $m has metadata-value == $v;
-"""
-_METADATA_GET = """
-match $m isa graph-metadata, has metadata-key $k, has metadata-value $v;
-fetch { "k": $k, "v": $v };
-"""
-_TRIPLETS_BATCH = """
-match
-  $e isa edge, links (source: $s, target: $t), has edge-key $k;
-sort $k;
-offset {offset};
-limit {limit};
-fetch {{ "start": {{ $s.* }}, "edge": {{ $e.* }}, "end": {{ $t.* }} }};
-"""
-
-# Filterable attributes promoted out of properties-json, usable server-side.
-_PROMOTED_FILTER_ATTRS = {"type": "node-type", "name": "name"}
-
-
-@dataclass(frozen=True)
-class _ProvenanceAttach:
-    """One provenance change: the transition to apply per artifact, plus the
-    ref entities the change may link to (put before the chunks run)."""
-
-    transition: Any
-    keys: list[str] = field(default_factory=list)
-    run_refs: list[str] = field(default_factory=list)
-
-    @classmethod
-    def for_keys(cls, keys: list[str], run: str | None) -> "_ProvenanceAttach":
-        run_refs = [make_source_run_ref(run, key) for key in keys] if run else []
-        return cls(
-            lambda current, refs: provenance_after_attach(current, refs, keys, run),
-            keys,
-            run_refs,
-        )
-
-    @classmethod
-    def removing(cls, keys: list[str]) -> "_ProvenanceAttach":
-        return cls(lambda current, refs: provenance_after_remove(current, refs, keys))
-
-
-class TypeDBAdapter(GraphDBInterface):
+class TypeDBAdapter(ProvenanceMixin, GraphDBInterface):
     """Adapter for TypeDB as a cognee graph store."""
 
     # Cognee gates its Cypher-generating search types on this flag; TypeQL-only
@@ -606,15 +188,9 @@ class TypeDBAdapter(GraphDBInterface):
 
     @staticmethod
     def _tls_config_from_env(environ=os.environ):
-        """TLS settings from ``TYPEDB_TLS`` / ``TYPEDB_TLS_ROOT_CA``.
-
-        ``TYPEDB_TLS`` unset or false: plaintext. True: TLS with the system's
-        native trust roots, or with the PEM bundle at ``TYPEDB_TLS_ROOT_CA``
-        when that is set (self-signed / private CA deployments). Any other
-        value is an error rather than a silent fall back to plaintext.
-        The mode is process-wide: cognee caches one engine per dataset, so a
-        change to these variables takes effect on the next driver open.
-        """
+        """TLS settings from ``TYPEDB_TLS`` (unset/false: plaintext; true: the
+        system trust roots, or the PEM bundle at ``TYPEDB_TLS_ROOT_CA``).
+        Any other value is an error rather than a silent fall back."""
         from typedb.driver import DriverTlsConfig
 
         value = environ.get(TLS_ENV, "").strip().lower()
@@ -660,13 +236,9 @@ class TypeDBAdapter(GraphDBInterface):
             driver.close()
 
     async def close(self) -> None:
-        """Release the native TypeDB connection and worker threads.
-
-        Called by cognee's engine cache on eviction (prune, dataset deletion);
-        without it the gRPC connection would leak until GC. The executor is
-        drained BEFORE the driver closes so in-flight transactions finish on
-        a live connection. The adapter reopens lazily if used again.
-        """
+        """Release the driver and worker threads (cognee calls this on cache
+        eviction). The pool drains before the driver closes so in-flight
+        transactions finish; the adapter reopens lazily if used again."""
         async with self._lock:
             executor, driver = self._detach_driver_and_executor()
             if executor is not None:
@@ -675,13 +247,9 @@ class TypeDBAdapter(GraphDBInterface):
                 await asyncio.to_thread(driver.close)
 
     def _provision_database_sync(self) -> None:
-        """Create the database if missing and (re)define the cognee schema.
-
-        Write path only. The define always runs: it is idempotent, and
-        re-running it applies additive schema evolution to pre-existing
-        databases. (A presence check was tried and reverted: substring
-        matching misfired on foreign types and froze the schema at v1.)
-        """
+        """Create the database if missing and (re)define the schema. Write
+        path only; the define is idempotent and always runs, so additive
+        schema changes reach existing databases."""
         from typedb.driver import TransactionType
 
         driver = self._get_driver()
@@ -703,12 +271,9 @@ class TypeDBAdapter(GraphDBInterface):
         self._schema_initialized = True
 
     def _refuse_pre_link_schema_sync(self, driver) -> None:
-        """Refuse a database whose nodes still own provenance attributes: it
-        was written by an earlier version of this adapter. The new define
-        would succeed (it only adds types) and every existing artifact would
-        then read as unowned, so cognee's dataset deletes and run rollbacks
-        would silently remove nothing.
-        """
+        """Refuse a database written by an earlier version that stored
+        provenance as artifact attributes: the additive define would succeed
+        and every artifact would then read as unowned."""
         from typedb.driver import TransactionType
 
         # Phrased over all ownerships so it also runs on a database that has
@@ -756,14 +321,10 @@ class TypeDBAdapter(GraphDBInterface):
         return TransactionType.READ
 
     def _run_batch_sync(self, specs, transaction_type, collect_rows: bool):
-        """Run (query, given_rows) specs in order in one transaction.
-
-        Query promises are all fired before any is resolved, so round trips
-        are pipelined server-side while execution order is preserved. In a
-        multi-query write batch the answers' row streams must not be
-        iterated: a later write in the same transaction interrupts earlier
-        answer streams (TSV13) — resolve() still surfaces per-query errors.
-        """
+        """Run (query, given_rows) specs in order in one transaction. Promises
+        are all fired before any is resolved (pipelined, order preserved).
+        Write answers are never iterated: a later write interrupts earlier
+        answer streams (TSV13), and resolve() still surfaces errors."""
         from typedb.driver import TransactionType
 
         driver = self._get_driver()
@@ -791,11 +352,8 @@ class TypeDBAdapter(GraphDBInterface):
         return [(query, None) if isinstance(query, str) else query for query in queries]
 
     async def _read_batch(self, queries) -> list[list[dict]]:
-        """Run read queries in one READ transaction; returns rows per query.
-
-        A missing database yields empty results for every query rather than
-        being created (see _database_available).
-        """
+        """Run read queries in one READ transaction; rows per query. A missing
+        database yields empty results rather than being created."""
         from typedb.driver import TransactionType
 
         if not await self._database_available():
@@ -816,12 +374,8 @@ class TypeDBAdapter(GraphDBInterface):
 
     async def _retry_commit_conflicts(self, attempt, retry: bool = True):
         """Run ``attempt()`` until it succeeds or the conflict budget ends.
-
-        Only [STC2] commit conflicts are retried (the failed commit rolled the
-        whole transaction back, so replaying never duplicates work); any
-        other error propagates at once. After COMMIT_RETRY_WARN_AFTER
-        rounds a warning names the contention.
-        """
+        Only [STC2] commit conflicts are retried; any other error propagates.
+        A warning names the contention after COMMIT_RETRY_WARN_AFTER rounds."""
         deadline = time.monotonic() + self._commit_retry_seconds
         rounds = 0
         while True:
@@ -857,14 +411,8 @@ class TypeDBAdapter(GraphDBInterface):
             raise
 
     async def _write_batch(self, queries, retry: bool = True) -> None:
-        """Run write queries in one WRITE transaction; results are discarded.
-
-        Rows are never collected: errors surface via resolve()/commit(), and
-        iterating write answers is pure FFI overhead (and forbidden anyway in
-        multi-query batches, see _run_batch_sync). Commit isolation conflicts
-        are retried with backoff: a failed commit rolls the whole transaction
-        back, so replaying it can never duplicate work.
-        """
+        """Run write queries in one WRITE transaction, retried on commit
+        conflicts; answers are discarded (see _run_batch_sync)."""
         from typedb.driver import TransactionType
 
         await self._provision_database()
@@ -883,18 +431,15 @@ class TypeDBAdapter(GraphDBInterface):
         key: str | None = None,
         provenance=None,
     ):
-        """Upsert rows as chunked transactions.
+        """Upsert rows as chunked transactions, WRITE_CONCURRENCY in flight.
 
         ``created_query`` (with ``key``) adds the set-once created-at statement
-        to each chunk's transaction. With ``provenance`` = (kind, id_field,
-        attach) each chunk's transaction also attaches provenance to the rows
-        it upserted (atomic per chunk); the ref entities it links to are put
-        first, in their own transaction. Chunks run with WRITE_CONCURRENCY in
-        flight either way. The batch is not atomic: on the first failure,
-        chunks not yet started are cancelled and chunks already committed
-        stay committed. A chunk whose transaction is in flight when the
-        batch fails or the caller is cancelled runs to its end first (commit
-        or roll back), so the caller never observes a chunk still landing.
+        to each chunk. ``provenance`` = (kind, id_field, attach) folds the
+        provenance attach into each chunk's transaction, after the batch's
+        ref entities are put in their own transaction. On the first failure,
+        chunks not yet started are cancelled and committed chunks stay; an
+        in-flight chunk runs to its end before the failure or a cancellation
+        propagates.
         """
         if not rows:
             return
@@ -946,170 +491,6 @@ class TypeDBAdapter(GraphDBInterface):
 
         await self._retry_commit_conflicts(attempt)
 
-    # ------------------------------------------------------------------
-    # Read-modify-write primitives (one transaction each, retried on STC2)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _ordered_links(entries) -> list[str]:
-        """Keys of link entries ``{"k": key, "p": position}`` in attach order."""
-        return [entry["k"] for entry in sorted(entries or [], key=lambda entry: entry["p"])]
-
-    @classmethod
-    def _decode_provenance(cls, document: dict) -> tuple[list[str], list[str]]:
-        """(ordered source ref keys, ordered run refs) from a document carrying
-        ``keys`` / ``runs`` link lists."""
-        return cls._ordered_links(document.get("keys")), cls._ordered_links(document.get("runs"))
-
-    @staticmethod
-    def _ref_put_specs(keys, run_refs) -> list[tuple[str, list[dict]]]:
-        specs = []
-        if keys:
-            specs.append(
-                (
-                    _PUT_SOURCE_REF,
-                    [
-                        {"k": key, "d": str(get_dataset_id_from_source_ref_key(key))}
-                        for key in sorted(keys)
-                    ],
-                )
-            )
-        if run_refs:
-            specs.append(
-                (
-                    _PUT_RUN_REF,
-                    [
-                        {"k": ref, "run": str(get_pipeline_run_id_from_source_run_ref(ref))}
-                        for ref in sorted(run_refs)
-                    ],
-                )
-            )
-        return specs
-
-    @staticmethod
-    def _rows_by_ref(link_rows: list[dict]) -> dict[str, list[dict]]:
-        """Group link rows by ref value, dropping the value from each row."""
-        grouped: dict[str, list[dict]] = {}
-        for row in link_rows:
-            grouped.setdefault(row["v"], []).append({k: v for k, v in row.items() if k != "v"})
-        return grouped
-
-    @classmethod
-    def _resolve_refs(cls, tx, link: str, values: set[str]) -> dict[str, str]:
-        """IIDs of the ref entities for ``values`` (absent ones are omitted)."""
-        if not values:
-            return {}
-        rows = [{"v": value} for value in sorted(values)]
-        answer = tx.query(_ref_lookup_query(link), given_rows=rows).resolve()
-        return {row["v"]: row["r"] for row in cls._collect_answer(answer)}
-
-    async def _ensure_provenance_refs(self, attach: "_ProvenanceAttach") -> None:
-        """Put the ref entities a batch will link to, once, before its chunks
-        (idempotent; retried, since two batches may create one key at once)."""
-        specs = self._ref_put_specs(attach.keys, attach.run_refs)
-        if specs:
-            await self._write_batch(specs)
-
-    def _provenance_change_sync(self, kind: str, identities: list[str], transition, pre_specs=()):
-        """In one WRITE transaction: run ``pre_specs`` (a chunk's upserts),
-        read each artifact's provenance links, apply the pure ``transition``,
-        link/unlink the ref entities for the difference, commit.
-
-        The reads happen after the pre-specs, so a folded chunk sees the
-        artifacts it just upserted, and their streams are drained before
-        any further write is issued (TSV13). New links get positions after
-        the artifact's highest existing one, so order survives removals; a
-        retry after a rolled-back commit re-reads and cannot drift.
-        """
-        from typedb.driver import TransactionType
-
-        driver = self._get_driver()
-        with driver.transaction(self.database_name, TransactionType.WRITE) as tx:
-            for query_text, given_rows in pre_specs:
-                tx.query(query_text, given_rows=given_rows).resolve()
-            rows = [{"id": identity} for identity in identities]
-            current: dict[str, dict[str, list]] = {
-                identity: {"ref": [], "run": []} for identity in identities
-            }
-            for link in ("ref", "run"):
-                for entry in self._collect_answer(
-                    tx.query(_links_read_query(kind, link), given_rows=rows).resolve()
-                ):
-                    current[entry["id"]][link].append(entry)
-            inserts: dict[str, list[dict]] = {"ref": [], "run": []}
-            deletes: dict[str, list[dict]] = {"ref": [], "run": []}
-            for identity, links in current.items():
-                keys = self._ordered_links(links["ref"])
-                run_refs = self._ordered_links(links["run"])
-                columns = transition(keys, run_refs)
-                for link, old, new in (
-                    ("ref", links["ref"], columns.source_ref_keys),
-                    ("run", links["run"], columns.source_run_refs),
-                ):
-                    old_keys = {entry["k"] for entry in old}
-                    next_position = max((entry["p"] for entry in old), default=-1) + 1
-                    for value in new:
-                        if value not in old_keys:
-                            inserts[link].append({"id": identity, "v": value, "p": next_position})
-                            next_position += 1
-                    for value in sorted(old_keys - set(new)):
-                        deletes[link].append({"id": identity, "v": value})
-            changed = {
-                row["id"] for rows_ in (*deletes.values(), *inserts.values()) for row in rows_
-            }
-            for link in ("ref", "run"):
-                by_ref_delete = self._rows_by_ref(deletes[link])
-                by_ref_insert = self._rows_by_ref(inserts[link])
-                iids = self._resolve_refs(tx, link, set(by_ref_delete) | set(by_ref_insert))
-                for value, link_rows in by_ref_delete.items():
-                    if value in iids:  # no entity means no link to remove
-                        tx.query(
-                            _link_delete_query(kind, link, iids[value]), given_rows=link_rows
-                        ).resolve()
-                # An insert whose ref entity is missing would match nothing and
-                # commit an unowned artifact, so a missing ref is an error.
-                missing = sorted(set(by_ref_insert) - set(iids))
-                if missing:
-                    raise RuntimeError(
-                        f"provenance ref entities missing for {link} links: {missing[:3]}"
-                    )
-                for value, link_rows in by_ref_insert.items():
-                    tx.query(
-                        _link_insert_query(kind, link, iids[value]), given_rows=link_rows
-                    ).resolve()
-            if changed:
-                now = _now_ms()
-                tx.query(
-                    _touch_query(kind), given_rows=[{"id": i, "now": now} for i in sorted(changed)]
-                ).resolve()
-            tx.commit()
-
-    async def _provenance_change(self, kind: str, identities, attach: "_ProvenanceAttach") -> None:
-        """Explicit attach/remove: apply ``attach.transition`` to every
-        artifact in ``identities`` in concurrent chunk-sized transactions,
-        after putting any ref entities the change links to. Each chunk is
-        retried on commit conflicts with other writers; the transition is
-        idempotent, so a retried chunk cannot double-record."""
-        identities = list(dict.fromkeys(str(identity) for identity in identities))
-        if not identities:
-            return
-        await self._provision_database()
-        await self._ensure_provenance_refs(attach)
-        size = self._chunk_rows
-        tasks = [
-            asyncio.create_task(
-                self._write_chunk([], (kind, identities[start : start + size], attach.transition))
-            )
-            for start in range(0, len(identities), size)
-        ]
-        try:
-            await asyncio.gather(*tasks)
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-
     def _mutate_properties_sync(self, kind: str, identities, mutate) -> set[str]:
         """In one WRITE transaction: read properties-json for ``identities``
         (all artifacts when None), apply ``mutate(identity, props) -> props |
@@ -1146,10 +527,9 @@ class TypeDBAdapter(GraphDBInterface):
         return {update["id"] for update in updates}
 
     async def _mutate_properties(self, kind: str, identities, mutate) -> set[str]:
-        """Read-modify-write ``properties-json`` through ``mutate``; see the
-        sync primitive. ``identities=None`` scans every artifact in a READ
-        transaction first and writes only the candidates, so the write
-        transaction (and any STC2 retry) touches the rows it changes."""
+        """Read-modify-write ``properties-json`` through ``mutate``.
+        ``identities=None`` finds the candidates in a READ transaction first,
+        so the write transaction touches only the rows it changes."""
         if identities is None:
             documents = (await self._read_batch([_properties_read_query(kind, True)]))[0]
             identities = []
@@ -1280,11 +660,7 @@ class TypeDBAdapter(GraphDBInterface):
                   'fetch { "node": { $n.* } };', {"name": "cognee"})
 
         ``transaction_type`` ("read" | "write" | "schema") overrides the
-        keyword-based inference for queries the heuristic would misjudge.
-
-        Note: cognee's Cypher-oriented search types are disabled for this
-        adapter via ``supports_cypher_queries = False``; a TypeQL
-        natural-language retriever is planned alongside it.
+        keyword-based inference.
         """
         from typedb.driver import TransactionType
 
@@ -1311,11 +687,8 @@ class TypeDBAdapter(GraphDBInterface):
         return bool(results[0])
 
     async def add_node(self, node: DataPoint | str, properties: dict[str, Any] | None = None):
-        """Add (or update) a single node from a DataPoint or an id + properties.
-
-        Carries no provenance, so existing provenance links of the node
-        stamps on the node are left untouched.
-        """
+        """Add (or update) one node from a DataPoint or an id + properties.
+        Carries no provenance; existing links are left untouched."""
         if isinstance(node, DataPoint):
             row = self._node_upsert_row(node)
         else:
@@ -1325,48 +698,15 @@ class TypeDBAdapter(GraphDBInterface):
         row["now"] = _now_ms()
         await self._write_batch([(_NODE_UPSERT, [row])])
 
-    @staticmethod
-    def _validated_pipeline_run_id(pipeline_run_id) -> str | None:
-        """Validate a pipeline run id (UUID or its string form) before any
-        server contact; cognee's transition would otherwise fail mid-transaction."""
-        if pipeline_run_id is None:
-            return None
-        try:
-            return str(coerce_run_uuid(pipeline_run_id))
-        except ValueError as error:
-            raise ValueError(f"pipeline_run_id must be a UUID, got {pipeline_run_id!r}") from error
-
-    @classmethod
-    def _attach_for_batch(cls, source_ref_key: str | None, pipeline_run_id):
-        """The provenance attach folded into add_nodes/add_edges, or None.
-
-        Delegates to cognee's ``provenance_after_attach`` (Model A: a key's run
-        mapping is recorded only when the key is new to the artifact).
-        """
-        if source_ref_key is None:
-            return None
-        try:
-            get_dataset_id_from_source_ref_key(source_ref_key)
-        except ValueError as error:
-            raise ValueError(
-                "source_ref_key must be built with cognee's make_source_ref_key()"
-            ) from error
-        run = cls._validated_pipeline_run_id(pipeline_run_id)
-        return _ProvenanceAttach.for_keys([source_ref_key], run)
-
     async def add_nodes(
         self,
         nodes: list[DataPoint],
         source_ref_key: str | None = None,
         pipeline_run_id: str | None = None,
     ) -> None:
-        """Upsert a batch of DataPoints in chunked, concurrent transactions.
-
-        With ``source_ref_key`` the provenance attach is folded into each
-        chunk's transaction as links to ref entities (module docstring); the
-        chunks run concurrently. Rows sharing a node id collapse to the last
-        one.
-        """
+        """Upsert a batch of DataPoints in chunked, concurrent transactions,
+        attaching provenance per chunk when ``source_ref_key`` is given. Rows
+        sharing a node id collapse to the last one."""
         if not nodes:
             return
         attach = self._attach_for_batch(source_ref_key, pipeline_run_id)
@@ -1411,11 +751,8 @@ class TypeDBAdapter(GraphDBInterface):
         return bool(matched)
 
     async def has_edges(self, edges):
-        """Return the (source_id, target_id, relationship_name) tuples that exist.
-
-        Cognee consumes this as a list of existing edge tuples (see
-        retrieve_existing_edges), not as booleans. Lookup is by edge-key.
-        """
+        """The (source_id, target_id, relationship_name) tuples that exist;
+        cognee consumes a list of tuples here, not booleans."""
         if not edges:
             return []
         rows = [
@@ -1450,15 +787,11 @@ class TypeDBAdapter(GraphDBInterface):
         source_ref_key: str | None = None,
         pipeline_run_id: str | None = None,
     ) -> None:
-        """Upsert a batch of edges in chunked, concurrent transactions.
-
-        Edge identity is the edge-key; properties are replaced on re-add and
-        duplicate identities within a batch collapse to the last row. With
-        ``source_ref_key`` the provenance attach is folded into each chunk's
-        transaction as links to ref entities (module docstring); the chunks
-        run concurrently. Edges whose endpoints are missing are skipped
-        (cognee adds nodes before edges).
-        """
+        """Upsert a batch of edges in chunked, concurrent transactions,
+        attaching provenance per chunk when ``source_ref_key`` is given.
+        Identity is the edge-key: properties are replaced on re-add and
+        duplicates within a batch collapse to the last row. Edges whose
+        endpoints are missing are skipped (cognee adds nodes first)."""
         if not edges:
             return
         attach = self._attach_for_batch(source_ref_key, pipeline_run_id)
@@ -1498,12 +831,9 @@ class TypeDBAdapter(GraphDBInterface):
         )
 
     async def get_edges(self, node_id: str):
-        """Edges incident to a node, anchor-first: (node_id, neighbour_id, {...}).
-
-        The de facto cognee adapter convention (and what format_edges in the
-        memify pipeline assumes) is that slot 0 is the queried node and slot 1
-        the neighbour, regardless of the edge's true direction.
-        """
+        """Edges incident to a node as (node_id, neighbour_id, {...}): slot 0
+        is always the queried node, whatever the edge's direction, which is
+        what cognee's format_edges assumes."""
         anchor = str(node_id)
         seen: dict[tuple[str, str, str], None] = {}
         for document in await self._incident_edge_documents([anchor]):
@@ -1608,13 +938,10 @@ class TypeDBAdapter(GraphDBInterface):
         depth: int = 1,
         edge_types: list[str] | None = None,
     ) -> tuple[list[tuple[str, dict]], list[tuple[str, str, str, dict]]]:
-        """K-hop neighborhood of the seed nodes, in get_graph_data() shape.
-
-        Traversal follows only ``edge_types`` when given; the result is the
-        induced subgraph over the reached nodes. Edge docs are harvested from
-        the BFS sweeps themselves (plus one sweep over the never-swept final
-        frontier), so each node's incident edges cross the wire once.
-        """
+        """K-hop neighborhood of the seed nodes, in get_graph_data() shape:
+        the induced subgraph over the reached nodes, following only
+        ``edge_types`` when given. Each node's incident edges cross the wire
+        once."""
         if not node_ids:
             return ([], [])
         wanted_types = set(edge_types) if edge_types else None
@@ -1776,13 +1103,10 @@ class TypeDBAdapter(GraphDBInterface):
         return (nodes, edges)
 
     async def get_id_filtered_graph_data(self, target_ids: list[str]):
-        """Targets, their direct neighbours, and only the edges touching a target.
-
-        Same shape as get_graph_data(). CogneeGraph prefers this over the
-        whole-graph projection whenever an adapter provides it, which is what
-        keeps GRAPH_COMPLETION search cost proportional to the search rather
-        than to the graph. One read transaction.
-        """
+        """Targets, their direct neighbours, and only the edges touching a
+        target, in get_graph_data() shape. CogneeGraph prefers this to the
+        whole-graph projection, which keeps search cost proportional to the
+        search rather than to the graph."""
         if not target_ids:
             return ([], [])
         if not all(isinstance(target_id, str) for target_id in target_ids):
@@ -1857,14 +1181,10 @@ class TypeDBAdapter(GraphDBInterface):
         return (list(nodes.items()), self._edges_within_node_set(edge_docs, set(nodes)))
 
     async def get_filtered_graph_data(self, attribute_filters):
-        """Nodes matching the attribute filters, and edges between them.
-
-        ``attribute_filters`` is a list with one dict of {attribute: [values]};
-        a node matches when every filtered attribute has an allowed value.
-        Filters over the promoted attributes ("type", "name") with string
-        values run server-side; anything else falls back to a client-side
-        scan of the canonical properties-json payload.
-        """
+        """Nodes matching ``attribute_filters`` ({attribute: [values]}, all
+        must match) and the edges between them. Filters on the promoted
+        "type" / "name" attributes run server-side; others scan the payload
+        client-side."""
         filters = {attribute: list(values) for attribute, values in attribute_filters[0].items()}
         promoted = (
             filters
@@ -1938,23 +1258,14 @@ class TypeDBAdapter(GraphDBInterface):
         return components
 
     async def get_disconnected_nodes(self) -> list[str]:
-        """Ids of fully isolated nodes (no incident edges at all).
-
-        This deliberately matches the reference (ladybug) adapter's
-        degree-zero semantics, NOT "outside the largest component": cognee's
-        remove_disconnected_chunks deletes every id returned here, so
-        returning smaller-but-connected components would destroy real data.
-        """
+        """Ids of nodes with no incident edges at all (Ladybug's degree-zero
+        semantics: cognee deletes every id returned here)."""
         rows = (await self._read_batch([_ISOLATED_NODE_IDS]))[0]
         return [row["id"] for row in rows]
 
     async def get_graph_metrics(self, include_optional=False):
         """Structural metrics; all-pairs metrics are reported unsupported (-1).
-
-        Failures propagate (with the error logged) rather than returning a
-        zeroed dict: cognee persists these metrics per pipeline run and would
-        cache the zeros as fact.
-        """
+        Failures propagate rather than returning zeros cognee would persist."""
         try:
             node_ids, endpoints = await self._edge_endpoint_pairs()
             num_nodes = len(node_ids)
@@ -1997,203 +1308,6 @@ class TypeDBAdapter(GraphDBInterface):
         raise SearchTypeNotSupported(
             "Temporal search is not yet supported with the TypeDBAdapter graph backend."
         )
-
-    # ------------------------------------------------------------------
-    # Graph provenance (cognee's 15-method contract) and parity methods
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _edge_identity_key(edge: EdgeIdentity) -> str:
-        return _edge_key(str(edge.source_id), str(edge.target_id), edge.relationship_name)
-
-    async def attach_node_source_refs(self, node_ids, source_ref_keys, pipeline_run_id=None):
-        if not source_ref_keys:
-            return
-        run = self._validated_pipeline_run_id(pipeline_run_id)
-        await self._provenance_change(
-            "node", node_ids, _ProvenanceAttach.for_keys(list(source_ref_keys), run)
-        )
-
-    async def attach_edge_source_refs(self, edges, source_ref_keys, pipeline_run_id=None):
-        if not source_ref_keys:
-            return
-        run = self._validated_pipeline_run_id(pipeline_run_id)
-        await self._provenance_change(
-            "edge",
-            [self._edge_identity_key(edge) for edge in edges],
-            _ProvenanceAttach.for_keys(list(source_ref_keys), run),
-        )
-
-    async def remove_node_source_refs(self, node_ids, source_ref_keys):
-        if not source_ref_keys:
-            return
-        await self._provenance_change(
-            "node", node_ids, _ProvenanceAttach.removing(list(source_ref_keys))
-        )
-
-    async def remove_edge_source_refs(self, edges, source_ref_keys):
-        if not source_ref_keys:
-            return
-        await self._provenance_change(
-            "edge",
-            [self._edge_identity_key(edge) for edge in edges],
-            _ProvenanceAttach.removing(list(source_ref_keys)),
-        )
-
-    async def delete_edge_triples(self, edges) -> None:
-        """Delete the given edges only; their endpoint nodes are kept."""
-        if not edges:
-            return
-        keys = dict.fromkeys(self._edge_identity_key(edge) for edge in edges)
-        rows = [{"id": key} for key in keys]
-        await self._write_batch(
-            [(query, rows) for query in _link_deletes(_DELETE_LINKS_OF_EDGES_BY_KEY)]
-            + [(_DELETE_EDGES_BY_KEY, rows)]
-        )
-
-    def _provenance_columns_from_document(self, document: dict) -> ProvenanceColumns:
-        keys, run_refs = self._decode_provenance(document)
-        return ProvenanceColumns(keys, derive_dataset_ids(keys), derive_run_ids(run_refs), run_refs)
-
-    async def get_node_delete_data(self, node_ids) -> dict[str, NodeDeleteData]:
-        if not node_ids:
-            return {}
-        rows = [{"id": str(node_id)} for node_id in dict.fromkeys(node_ids)]
-        documents = (await self._read_batch([(_NODE_DELETE_DATA, rows)]))[0]
-        result: dict[str, NodeDeleteData] = {}
-        for document in documents:
-            node_doc = document["node"]
-            node_id = node_doc["node-id"]
-            properties = self._document_to_node_dict(node_doc)
-            metadata = properties.get("metadata") or {}
-            indexed_fields = (
-                list(metadata.get("index_fields") or []) if isinstance(metadata, dict) else []
-            )
-            columns = self._provenance_columns_from_document(document)
-            result[node_id] = NodeDeleteData(
-                node_id=node_id,
-                node_type=str(properties.get("type") or node_doc.get("node-type") or ""),
-                indexed_fields=indexed_fields,
-                node_properties=properties,
-                source_ref_keys=columns.source_ref_keys,
-                source_dataset_ids=columns.source_dataset_ids,
-                source_run_ids=columns.source_run_ids,
-                source_run_refs=columns.source_run_refs,
-            )
-        return result
-
-    async def get_edge_delete_data(self, edges) -> dict[EdgeIdentity, EdgeDeleteData]:
-        if not edges:
-            return {}
-        # Lazy import: the modules layer imports get_graph_engine at package
-        # load, which would form a cycle with this adapter module.
-        from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
-
-        rows = [{"id": self._edge_identity_key(edge)} for edge in edges]
-        documents = (await self._read_batch([(_EDGE_DELETE_DATA, rows)]))[0]
-        result: dict[EdgeIdentity, EdgeDeleteData] = {}
-        for document in documents:
-            edge = EdgeIdentity(
-                document["source"], document["target"], document["relationship_name"]
-            )
-            properties = self._document_to_edge_properties(document["edge"])
-            columns = self._provenance_columns_from_document(document)
-            result[edge] = EdgeDeleteData(
-                edge=edge,
-                edge_text=get_edge_retrieval_text(
-                    properties.get("edge_text"), edge.relationship_name
-                ),
-                edge_properties=properties,
-                source_ref_keys=columns.source_ref_keys,
-                source_dataset_ids=columns.source_dataset_ids,
-                source_run_ids=columns.source_run_ids,
-                source_run_refs=columns.source_run_refs,
-            )
-        return result
-
-    async def _artifacts_by_ref(self, kind: str, link: str, by_derived: bool, value: str):
-        """Artifact documents linked to a ref entity, one per artifact (an
-        artifact linked to several refs of one dataset appears once)."""
-        query = _artifacts_by_ref_query(kind, link, by_derived)
-        documents = (await self._read_batch([(query, [{"v": value}])]))[0]
-        unique: dict = {}
-        for document in documents:
-            identity = document["id"] if kind == "node" else self._edge_identity_of(document)
-            unique.setdefault(identity, document)
-        return unique
-
-    @staticmethod
-    def _edge_identity_of(document: dict) -> EdgeIdentity:
-        return EdgeIdentity(document["source"], document["target"], document["relationship_name"])
-
-    async def find_nodes_by_source_ref(self, source_ref_key: str) -> list[str]:
-        return list(await self._artifacts_by_ref("node", "ref", False, source_ref_key))
-
-    async def find_edges_by_source_ref(self, source_ref_key: str) -> list[EdgeIdentity]:
-        return list(await self._artifacts_by_ref("edge", "ref", False, source_ref_key))
-
-    def _keys_owned_by_dataset(self, document: dict, dataset_id: str) -> list[str]:
-        keys, _refs = self._decode_provenance(document)
-        return [key for key in keys if str(get_dataset_id_from_source_ref_key(key)) == dataset_id]
-
-    def _keys_contributed_by_run(self, document: dict, pipeline_run_id: str) -> list[str]:
-        _keys, run_refs = self._decode_provenance(document)
-        return [
-            get_source_ref_key_from_source_run_ref(ref)
-            for ref in run_refs
-            if str(get_pipeline_run_id_from_source_run_ref(ref)) == pipeline_run_id
-        ]
-
-    async def find_node_source_refs_by_dataset(self, dataset_id: str) -> dict[str, list[str]]:
-        found = await self._artifacts_by_ref("node", "ref", True, dataset_id)
-        result = {}
-        for identity, doc in found.items():
-            owned = self._keys_owned_by_dataset(doc, dataset_id)
-            if owned:
-                result[identity] = owned
-        return result
-
-    async def find_edge_source_refs_by_dataset(
-        self, dataset_id: str
-    ) -> dict[EdgeIdentity, list[str]]:
-        found = await self._artifacts_by_ref("edge", "ref", True, dataset_id)
-        result = {}
-        for identity, doc in found.items():
-            owned = self._keys_owned_by_dataset(doc, dataset_id)
-            if owned:
-                result[identity] = owned
-        return result
-
-    async def find_node_source_refs_by_pipeline_run(
-        self, pipeline_run_id: str
-    ) -> dict[str, list[str]]:
-        found = await self._artifacts_by_ref("node", "run", True, pipeline_run_id)
-        result = {}
-        for identity, doc in found.items():
-            contributed = self._keys_contributed_by_run(doc, pipeline_run_id)
-            if contributed:
-                result[identity] = contributed
-        return result
-
-    async def find_edge_source_refs_by_pipeline_run(
-        self, pipeline_run_id: str
-    ) -> dict[EdgeIdentity, list[str]]:
-        found = await self._artifacts_by_ref("edge", "run", True, pipeline_run_id)
-        result = {}
-        for identity, doc in found.items():
-            contributed = self._keys_contributed_by_run(doc, pipeline_run_id)
-            if contributed:
-                result[identity] = contributed
-        return result
-
-    async def set_graph_metadata(self, metadata: dict[str, str]) -> None:
-        if not metadata:
-            return
-        rows = [{"k": str(key), "v": str(value)} for key, value in metadata.items()]
-        await self._write_batch([(_METADATA_SET, rows)])
-
-    async def get_graph_metadata(self) -> dict[str, str]:
-        return {doc["k"]: doc["v"] for doc in (await self._read_batch([_METADATA_GET]))[0]}
 
     async def remove_belongs_to_set_tags(self, tags, node_ids=None) -> None:
         if not tags or (node_ids is not None and not node_ids):
