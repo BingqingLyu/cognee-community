@@ -29,9 +29,12 @@ the ratios are what matter.
    and every row of a provenance batch carries the same source-ref key,
    dataset id and run id. Stored as artifact attributes, the fold had to
    run one chunk at a time (2,300 nodes/s at 5k). Stored as one entity per
-   ref with a link per artifact, chunks run concurrently again: 3,700
-   nodes/s and 3,500 edges/s with provenance (the bare upsert was not
-   re-measured in that run).
+   ref with a link per artifact, chunks run concurrently again: 4,452
+   nodes/s and 3,395 edges/s with provenance (the bare upsert was not
+   re-measured in that run). Links are written against the ref entity's
+   IID, resolved once per transaction: looked up by key per row, a dataset
+   with 5,000 data items (5,000 keys sharing one prefix, see the first
+   server observation) wrote at 181 rows/s; by IID, 1,780.
 4. **The set-once `created-at` negation was the node-write cost** (826
    rows/s against 18,000 without it), so nodes mirror the payload's
    `created_at` instead; edges keep the set-once statement.
@@ -104,52 +107,55 @@ on each backend: TypeDB 3.12.3 (this adapter as shipped: 100-row chunks,
 (cognee's default, embedded in-process) and Neo4j 5.28 community (cognee's
 built-in adapter, dockerized, no GDS plugin). Same laptop, same seeded data
 (random uuid4 ids, 400–900-char payloads), wall time per step. The TypeDB
-column was re-measured with the relational provenance model a week after
-the Ladybug and Neo4j columns, on the same otherwise idle machine.
+column was measured with the relational provenance model a week after the
+Ladybug and Neo4j columns, on the same otherwise idle machine.
 
 | step (5,000 nodes / 7,500 edges) | TypeDB | Ladybug | Neo4j |
 |---|---|---|---|
-| `add_nodes` + provenance | 1.35 s | 0.27 s | 1.14 s |
-| `add_edges` + provenance | 2.13 s | 0.72 s | 1.89 s |
-| re-upsert 5,000 nodes (second run id) | 0.69 s | 0.35 s | 0.91 s |
-| `get_graph_data` (12,500 rows) | 0.44 s | 0.05 s | 2.25 s |
-| `get_neighborhood` (10 seeds, depth 2) | 52 ms | 14 ms | 138 ms |
-| `get_edges` × 100 nodes | 150 ms | 141 ms | 252 ms |
-| `get_id_filtered_graph_data` (200 ids) | 50 ms | 16 ms | 157 ms |
+| `add_nodes` + provenance | 1.12 s | 0.27 s | 1.14 s |
+| `add_edges` + provenance | 2.21 s | 0.72 s | 1.89 s |
+| re-upsert 5,000 nodes (second run id) | 0.68 s | 0.35 s | 0.91 s |
+| `get_graph_data` (12,500 rows) | 0.28 s | 0.05 s | 2.25 s |
+| `get_neighborhood` (10 seeds, depth 2) | 47 ms | 14 ms | 138 ms |
+| `get_edges` × 100 nodes | 160 ms | 141 ms | 252 ms |
+| `get_id_filtered_graph_data` (200 ids) | 51 ms | 16 ms | 157 ms |
 | `get_graph_metrics` | 0.30 s | 1.00 s | needs GDS |
-| `find_nodes_by_source_ref` + `get_node_delete_data` (500) | 430 ms | 15 ms | 704 ms |
-| `delete_nodes` (500) | 340 ms | 21 ms | 73 ms |
-| 4 concurrent `add_nodes` (5,000 total, provenance) | 1.01 s | 0.50 s | 0.54 s |
+| `find_nodes_by_source_ref` + `get_node_delete_data` (500) | 415 ms | 15 ms | 704 ms |
+| `delete_nodes` (500) | 345 ms | 21 ms | 73 ms |
+| 4 concurrent `add_nodes` (5,000 total, provenance) | 0.99 s | 0.50 s | 0.54 s |
 
 | step (1,000 nodes / 1,500 edges) | TypeDB | Ladybug | Neo4j |
 |---|---|---|---|
-| `add_nodes` + provenance | 0.47 s | 0.11 s | 0.25 s |
-| `add_edges` + provenance | 0.73 s | 0.11 s | 0.61 s |
-| re-upsert 1,000 nodes | 0.16 s | 0.08 s | 0.20 s |
+| `add_nodes` + provenance | 0.74 s | 0.11 s | 0.25 s |
+| `add_edges` + provenance | 0.71 s | 0.11 s | 0.61 s |
+| re-upsert 1,000 nodes | 0.20 s | 0.08 s | 0.20 s |
 | `get_graph_data` (2,500 rows) | 0.08 s | 0.01 s | 0.43 s |
 | `get_neighborhood` (10 seeds, depth 2) | 28 ms | 9 ms | 81 ms |
-| `get_graph_metrics` | 62 ms | 210 ms | needs GDS |
-| `delete_nodes` (500) | 311 ms | 16 ms | 60 ms |
+| `get_graph_metrics` | 63 ms | 210 ms | needs GDS |
+| `delete_nodes` (500) | 290 ms | 16 ms | 60 ms |
 
 Reading it (ratios from the 5k table):
 
 - **Ladybug, embedded in-process, is faster at everything except
-  `get_graph_metrics`** (TypeDB about 3.3× faster there, at both sizes):
-  1.1× on `get_edges`, 2–5× on bulk writes, re-upsert, neighborhoods and
-  id-filtered projections, 9× on `get_graph_data`, 16–29× on deletes and
-  the delete planner. That is the price of a server with commit isolation
-  and per-dataset databases, not of this adapter.
+  `get_graph_metrics`** (TypeDB 3.3× faster there): 1.1× on
+  `get_edges`, 1.9–3.4× on `add_edges`, re-upsert, neighborhoods and
+  id-filtered projections, 4.2× on `add_nodes`, 5.6× on `get_graph_data`,
+  16–28× on deletes and the delete planner. That is the price of a
+  server with commit isolation and per-dataset databases, not of this
+  adapter.
 - **Against Neo4j, the other server: TypeDB is on par on bulk writes**
-  (`add_nodes` 1.18×, `add_edges` 1.13×, re-upsert 0.76× of Neo4j's time;
-  four concurrent provenance-carrying `add_nodes` calls 1.9× slower, since
-  one adapter's four slots are shared by all callers) **and 1.7–5×
-  faster on the read paths cognee hits most**: `get_graph_data` 5.1×
-  (projected on every GRAPH_COMPLETION search), neighborhoods 2.7×,
+  (`add_nodes` 0.99×, `add_edges` 1.17×, re-upsert 0.74× of Neo4j's time;
+  four concurrent provenance-carrying `add_nodes` calls 1.8× slower, since
+  one adapter's four slots are shared by all callers) **and 1.6–8.0×
+  faster on the read paths cognee hits most**: `get_graph_data` 8.0×
+  (projected on every GRAPH_COMPLETION search), neighborhoods 2.9×,
   id-filtered projections 3.1×, the delete planner's provenance lookups
-  1.6×, `get_edges` 1.7×. `delete_nodes` is 4.7× slower (the edge cascade
-  and the provenance-link cascade are separate queries).
-- Both comparisons use random ids; see the shared-prefix observation below
-  for why that matters.
+  1.7×, `get_edges` 1.6×. `delete_nodes` is 4.7× slower (the edge
+  cascade and the provenance-link cascade are separate queries).
+- Both tables' TypeDB columns come from one run of the shipped code
+  (2026-09-16); the Ladybug and Neo4j columns from the 2026-09-09 run. The
+  1k `add_nodes` figure carries fixed per-batch cost (the ref put, ten
+  chunks) and is noisier than the 5k one.
 
 ## Server observations worth raising with the TypeDB team
 

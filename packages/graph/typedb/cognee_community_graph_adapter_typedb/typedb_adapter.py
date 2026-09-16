@@ -209,6 +209,10 @@ match
 delete $l;
 """
 _LINK_TYPES = ("sourced-from", "run-attached")
+# Attributes earlier versions of this adapter put on node/edge for provenance.
+_PRE_LINK_PROVENANCE_ATTRIBUTES = frozenset(
+    {"source-ref-key", "source-dataset-id", "source-run-id", "source-run-ref", "provenance-json"}
+)
 
 
 def _link_deletes(template: str, **fields) -> list[str]:
@@ -369,16 +373,30 @@ def _links_fetch_list(var: str, link: str) -> str:
     )
 
 
-def _ref_exists_query(link: str) -> str:
+def _ref_lookup_query(link: str) -> str:
+    """Resolve ref entities by key, once per transaction. Links are then
+    written against the entity's IID: a key lookup per row would scan, since
+    every key of a dataset shares a long prefix (benchmarks/README.md)."""
     entity, key_attr, _derived, _relation, _role = _PROVENANCE_LINKS[link]
-    return f'given $v: string;\nmatch $r isa {entity}, has {key_attr} == $v;\nfetch {{ "v": $v }};'
+    return f"given $v: string;\nmatch $r isa {entity}, has {key_attr} == $v;\nselect $v, $r;"
 
 
-def _link_insert_query(kind: str, link: str) -> str:
-    entity, key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
+_IID_RE = re.compile(r"^0x[0-9a-f]+$")
+
+
+def _iid_literal(iid: str) -> str:
+    """An IID is the one value that goes into query text (the `given` stage
+    cannot bind one); validate it so nothing else ever can."""
+    if not _IID_RE.fullmatch(iid):
+        raise ValueError(f"not a TypeDB IID: {iid!r}")
+    return iid
+
+
+def _link_insert_query(kind: str, link: str, ref_iid: str) -> str:
+    entity, _key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
     return (
-        "given $id: string, $v: string, $p: integer;\n"
-        f"match {_MATCH_BY_ID[kind]} $r isa {entity}, has {key_attr} == $v;\n"
+        "given $id: string, $p: integer;\n"
+        f"match {_MATCH_BY_ID[kind]} $r isa {entity}, iid {_iid_literal(ref_iid)};\n"
         # insert, not put: the preceding read established the link is absent.
         f"insert (artifact: $x, {role}: $r) isa {relation}, has position == $p;"
     )
@@ -392,11 +410,11 @@ def _touch_query(kind: str) -> str:
     return f"given $id: string, $now: integer;\nmatch {match}\nupdate $x has updated-at == $now;"
 
 
-def _link_delete_query(kind: str, link: str) -> str:
-    entity, key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
+def _link_delete_query(kind: str, link: str, ref_iid: str) -> str:
+    entity, _key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
     return (
-        "given $id: string, $v: string;\n"
-        f"match {_MATCH_BY_ID[kind]} $r isa {entity}, has {key_attr} == $v;"
+        "given $id: string;\n"
+        f"match {_MATCH_BY_ID[kind]} $r isa {entity}, iid {_iid_literal(ref_iid)};"
         f" $l isa {relation}, links (artifact: $x, {role}: $r);\n"
         "delete $l;"
     )
@@ -685,23 +703,23 @@ class TypeDBAdapter(GraphDBInterface):
         self._schema_initialized = True
 
     def _refuse_pre_link_schema_sync(self, driver) -> None:
-        """Refuse a database whose nodes still own ``provenance-json``: it was
-        written by an earlier version that kept provenance as artifact
-        attributes. The new define would succeed (it only adds types) and
-        every existing artifact would then read as unowned, so cognee's
-        dataset deletes and run rollbacks would silently remove nothing.
+        """Refuse a database whose nodes still own provenance attributes: it
+        was written by an earlier version of this adapter. The new define
+        would succeed (it only adds types) and every existing artifact would
+        then read as unowned, so cognee's dataset deletes and run rollbacks
+        would silently remove nothing.
         """
         from typedb.driver import TransactionType
 
-        try:
-            with driver.transaction(self.database_name, TransactionType.READ) as tx:
-                owned = {
-                    row.get("a").get_label()
-                    for row in tx.query("match $t label node; $t owns $a; select $a;").resolve()
-                }
-        except Exception:
-            return  # no `node` type yet: an empty database, nothing to migrate
-        if "provenance-json" in owned:
+        # Phrased over all ownerships so it also runs on a database that has
+        # no `node` type yet (an unknown label would be a query error).
+        with driver.transaction(self.database_name, TransactionType.READ) as tx:
+            owned = {
+                row.get("a").get_label()
+                for row in tx.query("match $t owns $a; select $t, $a;").resolve()
+                if row.get("t").get_label() == "node"
+            }
+        if owned & _PRE_LINK_PROVENANCE_ATTRIBUTES:
             raise RuntimeError(
                 f"TypeDB database {self.database_name!r} was created by an earlier version "
                 "of this adapter (provenance stored as artifact attributes). Its provenance "
@@ -968,20 +986,22 @@ class TypeDBAdapter(GraphDBInterface):
             )
         return specs
 
+    @staticmethod
+    def _rows_by_ref(link_rows: list[dict]) -> dict[str, list[dict]]:
+        """Group link rows by ref value, dropping the value from each row."""
+        grouped: dict[str, list[dict]] = {}
+        for row in link_rows:
+            grouped.setdefault(row["v"], []).append({k: v for k, v in row.items() if k != "v"})
+        return grouped
+
     @classmethod
-    def _require_refs(cls, tx, link: str, values: set[str]) -> None:
-        """Raise if any ref entity a chunk is about to link to does not exist."""
+    def _resolve_refs(cls, tx, link: str, values: set[str]) -> dict[str, str]:
+        """IIDs of the ref entities for ``values`` (absent ones are omitted)."""
         if not values:
-            return
+            return {}
         rows = [{"v": value} for value in sorted(values)]
-        answer = tx.query(_ref_exists_query(link), given_rows=rows).resolve()
-        found = {document["v"] for document in cls._collect_answer(answer)}
-        missing = sorted(values - found)
-        if missing:
-            raise RuntimeError(
-                f"provenance ref entities missing for {link} links: {missing[:3]} "
-                "(the batch put them; was the database emptied concurrently?)"
-            )
+        answer = tx.query(_ref_lookup_query(link), given_rows=rows).resolve()
+        return {row["v"]: row["r"] for row in cls._collect_answer(answer)}
 
     async def _ensure_provenance_refs(self, attach: "_ProvenanceAttach") -> None:
         """Put the ref entities a batch will link to, once, before its chunks
@@ -1037,16 +1057,26 @@ class TypeDBAdapter(GraphDBInterface):
             changed = {
                 row["id"] for rows_ in (*deletes.values(), *inserts.values()) for row in rows_
             }
-            for link, link_rows in deletes.items():
-                if link_rows:
-                    tx.query(_link_delete_query(kind, link), given_rows=link_rows).resolve()
-            # A link insert whose ref entity is missing would match nothing
-            # and commit an unowned artifact, so verify the refs exist first.
-            for link, link_rows in inserts.items():
-                self._require_refs(tx, link, {row["v"] for row in link_rows})
-            for link, link_rows in inserts.items():
-                if link_rows:
-                    tx.query(_link_insert_query(kind, link), given_rows=link_rows).resolve()
+            for link in ("ref", "run"):
+                by_ref_delete = self._rows_by_ref(deletes[link])
+                by_ref_insert = self._rows_by_ref(inserts[link])
+                iids = self._resolve_refs(tx, link, set(by_ref_delete) | set(by_ref_insert))
+                for value, link_rows in by_ref_delete.items():
+                    if value in iids:  # no entity means no link to remove
+                        tx.query(
+                            _link_delete_query(kind, link, iids[value]), given_rows=link_rows
+                        ).resolve()
+                # An insert whose ref entity is missing would match nothing and
+                # commit an unowned artifact, so a missing ref is an error.
+                missing = sorted(set(by_ref_insert) - set(iids))
+                if missing:
+                    raise RuntimeError(
+                        f"provenance ref entities missing for {link} links: {missing[:3]}"
+                    )
+                for value, link_rows in by_ref_insert.items():
+                    tx.query(
+                        _link_insert_query(kind, link, iids[value]), given_rows=link_rows
+                    ).resolve()
             if changed:
                 now = _now_ms()
                 tx.query(
@@ -1283,7 +1313,7 @@ class TypeDBAdapter(GraphDBInterface):
     async def add_node(self, node: DataPoint | str, properties: dict[str, Any] | None = None):
         """Add (or update) a single node from a DataPoint or an id + properties.
 
-        Carries no provenance, so existing source-ref-key/source-run-id
+        Carries no provenance, so existing provenance links of the node
         stamps on the node are left untouched.
         """
         if isinstance(node, DataPoint):
@@ -1669,7 +1699,8 @@ class TypeDBAdapter(GraphDBInterface):
         if not node_ids:
             return
         anchor_role = "target" if incoming else "source"
-        rows = [{"id": str(node_id), "label": edge_label} for node_id in node_ids]
+        ids = dict.fromkeys(str(node_id) for node_id in node_ids)
+        rows = [{"id": node_id, "label": edge_label} for node_id in ids]
         link_queries = _link_deletes(_DELETE_LINKS_OF_LABELED_EDGES, anchor_role=anchor_role)
         await self._write_batch(
             [(query, rows) for query in link_queries]
@@ -1684,9 +1715,12 @@ class TypeDBAdapter(GraphDBInterface):
                 "match $l isa run-attached; delete $l;",
                 "match $e isa edge; delete $e;",
                 "match $n isa node; delete $n;",
-                # Ref entities are kept: a concurrent writer may be between
-                # putting them and linking to them, and unlinked refs are
-                # invisible to every read path.
+                # Ref entities with no links left are swept too (a writer that
+                # raced this and lost its refs fails its chunk with a clear
+                # error rather than committing unowned artifacts).
+                "match $r isa source-ref; not { $l isa sourced-from, links (ref: $r); };"
+                " delete $r;",
+                "match $r isa run-ref; not { $l isa run-attached, links (run: $r); }; delete $r;",
             ]
         )
 
@@ -2010,7 +2044,8 @@ class TypeDBAdapter(GraphDBInterface):
         """Delete the given edges only; their endpoint nodes are kept."""
         if not edges:
             return
-        rows = [{"id": self._edge_identity_key(edge)} for edge in edges]
+        keys = dict.fromkeys(self._edge_identity_key(edge) for edge in edges)
+        rows = [{"id": key} for key in keys]
         await self._write_batch(
             [(query, rows) for query in _link_deletes(_DELETE_LINKS_OF_EDGES_BY_KEY)]
             + [(_DELETE_EDGES_BY_KEY, rows)]

@@ -146,10 +146,10 @@ async def test_delete_node_cascades_to_edges(seeded):
 
 
 async def _link_count(adapter) -> int:
-    rows = await adapter.query(
-        "match $l isa sourced-from; reduce $c = count;",
-    )
-    return rows[0]["c"]
+    """Provenance links of both kinds."""
+    refs = await adapter.query("match $l isa sourced-from; reduce $c = count;")
+    runs = await adapter.query("match $l isa run-attached; reduce $c = count;")
+    return refs[0]["c"] + runs[0]["c"]
 
 
 async def test_delete_nodes_cascades_links_for_connected_sets_and_self_loops(seeded):
@@ -162,29 +162,30 @@ async def test_delete_nodes_cascades_links_for_connected_sets_and_self_loops(see
         [EdgeIdentity(seeded.dl, seeded.dl, "self_loop")], [seeded.key], seeded.run
     )
     before = await _link_count(adapter)
-    assert before == 3 + 3 + 1  # three nodes, three seeded edges, the self-loop
+    assert before == 2 * (3 + 3 + 1)  # ref + run link for three nodes, three edges, the loop
 
     await adapter.delete_nodes([seeded.dl, seeded.ml, seeded.dl])  # connected pair, dup id
 
     assert not await adapter.has_node(seeded.dl) and not await adapter.has_node(seeded.ml)
     assert await adapter.has_node(seeded.ai)
-    assert await _link_count(adapter) == 1  # only ai's own link remains
+    assert await _link_count(adapter) == 2  # only ai's own ref and run links remain
     assert await adapter.find_nodes_by_source_ref(seeded.key) == [seeded.ai]
 
 
 async def test_delete_paths_remove_provenance_links(seeded):
     adapter = seeded.adapter
-    assert await _link_count(adapter) == 6
+    assert await _link_count(adapter) == 12
 
     await adapter.delete_edge_triples([EdgeIdentity(seeded.ml, seeded.ai, "is_subset_of")])
-    assert await _link_count(adapter) == 5
+    assert await _link_count(adapter) == 10
 
     await adapter.remove_connection_to_successors_of([seeded.dl], "related_to")
-    assert await _link_count(adapter) == 4
+    assert await _link_count(adapter) == 8
 
     await adapter.delete_graph()
     assert await _link_count(adapter) == 0
     assert await adapter.find_nodes_by_source_ref(seeded.key) == []
-    # Ref entities survive an emptied graph; the next attach re-uses them.
-    refs = await adapter.query("match $r isa source-ref; reduce $c = count;")
-    assert refs[0]["c"] == 1
+    # Ref entities with nothing left to link are swept with the graph.
+    for entity in ("source-ref", "run-ref"):
+        refs = await adapter.query(f"match $r isa {entity}; reduce $c = count;")
+        assert refs[0]["c"] == 0

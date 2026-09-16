@@ -126,15 +126,16 @@ async def test_delete_racing_an_attach_leaves_no_dangling_links(adapter, second)
         node = Concept(name=f"doomed-{trial}")
         node_id = str(node.id)
         await adapter.add_nodes([node])
-        key = make_source_ref_key(uuid4(), uuid4())
+        keys = [make_source_ref_key(uuid4(), uuid4()) for _ in range(40)]  # a longer attach
 
         await asyncio.gather(
             adapter.delete_nodes([node_id]),
-            second.attach_node_source_refs([node_id], [key], str(uuid4())),
+            second.attach_node_source_refs([node_id], keys, str(uuid4())),
         )
 
         assert not await adapter.has_node(node_id)
-        dangling = await adapter.query(
-            "match $l isa sourced-from; not { $l links (artifact: $x); }; select $l;"
-        )
-        assert dangling == []
+        for link in ("sourced-from", "run-attached"):
+            dangling = await adapter.query(
+                f"match $l isa {link}; not {{ $l links (artifact: $x); }}; select $l;"
+            )
+            assert dangling == []
