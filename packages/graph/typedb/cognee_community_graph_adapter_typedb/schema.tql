@@ -29,9 +29,7 @@ define
     plays sourced-from:artifact, plays run-attached:artifact;
 
   # Provenance: one entity per source ref / run ref, linked to every artifact
-  # it owns; the link's position is the attach order (cognee asserts it).
-  # Artifacts never own the (shared, long) key strings themselves, so
-  # concurrent writers linking to one ref do not conflict.
+  # it owns; the link's position is the attach order.
   entity source-ref,
     owns source-ref-key @key, owns source-dataset-id,
     plays sourced-from:ref;

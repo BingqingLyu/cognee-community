@@ -10,29 +10,21 @@ the JSON, and are always written together with it. Edges carry an explicit
 ``edge-key`` (a JSON ``[source, target, relationship]`` triple) as their
 identity and ``edge-object-id`` (cognee's deterministic feedback id).
 
-Graph-native provenance follows cognee's contract exactly by delegating the
-state transitions to ``provenance_after_attach`` / ``provenance_after_remove``
-(Model A: a pipeline run is recorded against a source ref only when that ref
-is newly attached). The record is relational: one ``source-ref`` entity per
-key (owning the key and its dataset id) and one ``run-ref`` entity per run
-ref (owning the ref and its run id), linked to their artifacts by
-``sourced-from`` / ``run-attached`` relations whose ``position`` attribute
-is the attach order (cognee asserts it, and TypeDB's multi-valued
-attributes are unordered). The ref entities are ``put`` once per batch
-before its chunks run, so a chunk only looks a ref up and links to it. That
-matters because TypeDB conflicts concurrent inserts of *ownership* of the
-same long string value (benchmarks/README.md): artifacts own nothing
-shared, so provenance-carrying chunks run concurrently like any other
-write, and ``add_nodes`` / ``add_edges`` fold the attach into each chunk's
-transaction (upsert, read the links, apply the transition, link or unlink
-for the difference, commit), so no artifact is ever visible without its
-provenance, the invariant cognee's rollback and delete planners rely on.
-Writers in other adapter instances that touch the same artifact conflict
-at commit (``[STC2]``, verified in ``tests/integration/test_concurrency.py``
-and ``test_stress.py``) and are retried against a re-read within a time
-budget. Deleting an artifact must also delete its links: TypeDB keeps a
-relation whose role player was deleted, so every delete path removes the
-links first.
+Provenance (cognee's ``attach_*_source_refs`` / ``find_*_by_*`` /
+``get_*_delete_data`` family) delegates its state transitions to cognee's
+``provenance_after_attach`` / ``provenance_after_remove``, so the semantics
+match the built-in adapters. Storage is relational: one ``source-ref``
+entity per source ref key and one ``run-ref`` entity per run ref, linked to
+their artifacts by ``sourced-from`` / ``run-attached`` relations whose
+``position`` attribute records the attach order. ``add_nodes`` /
+``add_edges`` put the batch's ref entities first, then fold the attach into
+each chunk's transaction (upsert, read the links, apply the transition, link
+or unlink the difference, commit), so an artifact is never visible without
+its provenance. Every provenance change also updates the artifact's
+``updated-at``, which makes concurrent changes to one artifact conflict at
+commit so that the loser re-reads. Delete paths remove an artifact's links
+before the artifact, because TypeDB keeps a relation whose role player was
+deleted.
 
 A node's ``created-at`` mirrors its DataPoint payload's ``created_at``; an
 edge's is set once on first write; ``updated-at`` is the write time (all
@@ -300,18 +292,14 @@ select $id;
 """
 
 # Batch writes are split into transactions of this many rows, with up to
-# WRITE_CONCURRENCY transactions in flight. benchmarks/README.md (Phase 4
-# sweep): per-row cost grows superlinearly with rows per transaction, 100-row
-# chunks beat 200 by 12-32% at 2-4 in flight (equal at 1), 4 in flight is the knee.
+# WRITE_CONCURRENCY transactions in flight (both tuned in benchmarks/README.md).
 # Defaults; per-adapter values come from TYPEDB_WRITE_CHUNK_ROWS /
 # TYPEDB_WRITE_CONCURRENCY when set (read at construction).
 WRITE_CHUNK_ROWS = 100
 WRITE_CONCURRENCY = 4
 # Commit conflicts ([STC2]) are retried for this long with capped, fully
-# jittered backoff. A count would not do: under sustained contention from
-# another writer on the same database (another process, or a second cached
-# adapter for the same dataset) the loser keeps losing until the other
-# batch ends, which can take longer than any short fixed budget.
+# jittered backoff: a time budget, because a writer contending with another
+# process on the same database can lose every round until the other batch ends.
 COMMIT_RETRY_SECONDS = 30.0
 COMMIT_BACKOFF_CAP_SECONDS = 0.25
 COMMIT_RETRY_WARN_AFTER = 10
@@ -361,9 +349,8 @@ update $r has source-run-id == $run;
 
 def _links_read_query(kind: str, link: str) -> str:
     """One row per provenance link of each given artifact: its position and
-    the ref's key. Written as a per-link fetch on purpose: a `select` that
-    joins the key through the ref entity, followed by link inserts in the
-    same transaction, runs ~70x slower (benchmarks/README.md)."""
+    the ref's key. Keep the per-link fetch form (see benchmarks/README.md
+    for the server behaviour a join-based select triggers)."""
     _entity, key_attr, _derived, relation, role = _PROVENANCE_LINKS[link]
     return (
         "given $id: string;\n"
@@ -392,18 +379,15 @@ def _link_insert_query(kind: str, link: str) -> str:
     return (
         "given $id: string, $v: string, $p: integer;\n"
         f"match {_MATCH_BY_ID[kind]} $r isa {entity}, has {key_attr} == $v;\n"
-        # insert, not put: the read says the link is absent, and a `put`
-        # would scan the ref entity's existing links (thousands on a hub).
+        # insert, not put: the preceding read established the link is absent.
         f"insert (artifact: $x, {role}: $r) isa {relation}, has position == $p;"
     )
 
 
 def _touch_query(kind: str) -> str:
-    """Bump the artifact's updated-at. Every provenance change does this for
-    the artifacts it changed so that two writers changing one artifact
-    conflict at commit (TypeDB flags concurrent writes to one owner) and
-    the loser re-reads: without it, concurrent attaches of the same key
-    would both see it as new and link it twice."""
+    """Update the artifact's updated-at. Every provenance change does this
+    for the artifacts it changed, so that concurrent changes to one artifact
+    conflict at commit and the loser re-reads."""
     match = _MATCH_BY_ID[kind]
     return f"given $id: string, $now: integer;\nmatch {match}\nupdate $x has updated-at == $now;"
 
@@ -1057,10 +1041,7 @@ class TypeDBAdapter(GraphDBInterface):
                 if link_rows:
                     tx.query(_link_delete_query(kind, link), given_rows=link_rows).resolve()
             # A link insert whose ref entity is missing would match nothing
-            # and commit an unowned artifact, so verify the refs this chunk
-            # links to exist first. A read: re-putting them here made
-            # concurrent chunks conflict on the shared key and tripled the
-            # write time.
+            # and commit an unowned artifact, so verify the refs exist first.
             for link, link_rows in inserts.items():
                 self._require_refs(tx, link, {row["v"] for row in link_rows})
             for link, link_rows in inserts.items():

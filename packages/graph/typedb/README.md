@@ -219,26 +219,20 @@ ref only when that ref is newly attached. The record is relational: one
 `source-ref` entity per source ref key (owning the key and its dataset id)
 and one `run-ref` entity per run ref (owning the ref and its run id), linked
 to their artifacts by the `sourced-from` and `run-attached` relations. Each
-link carries a `position`, the attach order, because cognee asserts it and
-TypeDB's multi-valued attributes are unordered. `find_nodes_by_source_ref`
-and friends traverse those links; the dataset and pipeline-run lookups then
+link carries a `position`, the attach order. `find_nodes_by_source_ref` and
+friends traverse those links; the dataset and pipeline-run lookups then
 filter each artifact's links.
 
 `add_nodes` / `add_edges` put the batch's ref entities first, then fold the
 attach into each chunk's transaction (upsert, read the links, apply the
-transition, link or unlink for the difference, commit), so no node or edge
-is ever visible without its provenance, which cognee's rollback and delete
-planners rely on. Because artifacts only link to a ref rather than owning
-its key string, provenance-carrying chunks run concurrently like any other
-write; TypeDB conflicts concurrent inserts of ownership of the same long
-string value, which is why the keys live on the ref entities (see
-`benchmarks/README.md`). Every provenance change also bumps the artifact's
-`updated-at`, so two writers changing one artifact conflict at commit and
-the loser re-reads; those conflicts are retried for up to 30 seconds with
-capped, jittered backoff, and a warning is logged once the contention lasts
-ten rounds. Every delete path removes an artifact's links before the
-artifact, since TypeDB keeps a relation whose role player was deleted; ref
-entities themselves are kept (they are small and re-used).
+transition, link or unlink the difference, commit), so no node or edge is
+ever visible without its provenance, which cognee's rollback and delete
+planners rely on. Chunks run concurrently. Every provenance change also
+updates the artifact's `updated-at`, so two writers changing one artifact
+conflict at commit and the loser re-reads; conflicts are retried for up to
+30 seconds with capped, jittered backoff, and a warning is logged once the
+contention lasts ten rounds. Delete paths remove an artifact's links before
+the artifact; ref entities are kept and re-used.
 
 Feedback weights (`feedback_weight`) and truth state (`truth_alignment`,
 `truth_epoch`) live inside `properties-json`, where `CogneeGraph` reads them
