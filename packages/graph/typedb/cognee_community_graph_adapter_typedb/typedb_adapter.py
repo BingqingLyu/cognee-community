@@ -165,6 +165,9 @@ class TypeDBAdapter(ProvenanceMixin, GraphDBInterface):
         self._write_semaphore = asyncio.Semaphore(self._write_concurrency)
         # Guards driver open/close and executor creation across threads.
         self._state_lock = threading.Lock()
+        # Set while close() drains the pool: no new driver or pool may open,
+        # so a queued worker cannot leave a fresh driver behind.
+        self._closing = False
         # Small dedicated pool: makes the concurrency ceiling on the shared
         # native driver explicit instead of borrowing the default executor.
         self._executor: ThreadPoolExecutor | None = None
@@ -176,6 +179,8 @@ class TypeDBAdapter(ProvenanceMixin, GraphDBInterface):
     def _get_executor(self) -> ThreadPoolExecutor:
         with self._state_lock:
             if self._executor is None:
+                if self._closing:
+                    raise RuntimeError("TypeDB adapter is closing")
                 # One thread beyond the write concurrency so a read is never
                 # queued behind a full set of in-flight write chunks.
                 self._executor = ThreadPoolExecutor(
@@ -205,9 +210,13 @@ class TypeDBAdapter(ProvenanceMixin, GraphDBInterface):
         return DriverTlsConfig.enabled_with_native_root_ca()
 
     def _get_driver(self):
-        """Lazily open the (synchronous) TypeDB driver."""
+        """Lazily open the (synchronous) TypeDB driver. While the adapter is
+        closing, work already queued may still use the open driver, but no
+        new one is created."""
         with self._state_lock:
             if self._driver is None:
+                if self._closing:
+                    raise RuntimeError("TypeDB adapter is closing")
                 from typedb.driver import Credentials, DriverOptions, TypeDB
 
                 self._driver = TypeDB.driver(
@@ -217,33 +226,45 @@ class TypeDBAdapter(ProvenanceMixin, GraphDBInterface):
                 )
             return self._driver
 
-    def _detach_driver_and_executor(self):
-        """Take ownership of the current executor and driver (if any) and reset
-        the adapter to its unopened state, atomically. A call that arrives
-        afterwards opens a fresh pair instead of racing the closing one."""
+    def _begin_closing(self):
+        """Mark the adapter closing and take the pool to drain. Queued workers
+        keep the open driver; none can open a new driver or pool."""
         with self._state_lock:
-            executor, driver = self._executor, self._driver
-            self._executor = None
-            self._driver = None
+            self._closing = True
+            executor, self._executor = self._executor, None
+        return executor
+
+    def _finish_closing(self):
+        """After the pool has drained: take the driver to close and reset to
+        the unopened state, so the adapter reopens lazily if used again."""
+        with self._state_lock:
+            driver, self._driver = self._driver, None
             self._database_exists = False
             self._schema_initialized = False
-        return executor, driver
+            self._closing = False
+        return driver
 
     def _close_sync(self) -> None:
-        executor, driver = self._detach_driver_and_executor()
-        if executor is not None:
-            executor.shutdown(wait=True)
+        executor = self._begin_closing()
+        try:
+            if executor is not None:
+                executor.shutdown(wait=True)
+        finally:
+            driver = self._finish_closing()
         if driver is not None:
             driver.close()
 
     async def close(self) -> None:
-        """Release the driver and worker threads (cognee calls this on cache
-        eviction). The pool drains before the driver closes so in-flight
-        transactions finish; the adapter reopens lazily if used again."""
+        """Release the worker threads and the driver (cognee calls this on
+        cache eviction). The pool drains before the driver closes, so
+        in-flight transactions finish and nothing opens a driver afterwards."""
         async with self._lock:
-            executor, driver = self._detach_driver_and_executor()
-            if executor is not None:
-                await asyncio.to_thread(executor.shutdown, True)
+            executor = self._begin_closing()
+            try:
+                if executor is not None:
+                    await asyncio.to_thread(executor.shutdown, True)
+            finally:
+                driver = self._finish_closing()
             if driver is not None:
                 await asyncio.to_thread(driver.close)
 

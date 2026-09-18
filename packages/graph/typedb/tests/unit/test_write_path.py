@@ -267,3 +267,87 @@ async def test_cancelled_write_waits_for_the_in_flight_transaction():
         await task
     assert finished == ["committed"]  # the cancellation waited for it
     await adapter.close()
+
+
+class _FakeDriver:
+    instances: list = []
+
+    def __init__(self):
+        self.closed = False
+        _FakeDriver.instances.append(self)
+
+    def close(self):
+        self.closed = True
+
+
+def _patch_driver_factory(monkeypatch):
+    import typedb.driver
+
+    _FakeDriver.instances.clear()
+    monkeypatch.setattr(typedb.driver.TypeDB, "driver", staticmethod(lambda *a, **k: _FakeDriver()))
+
+
+async def test_close_drains_queued_work_before_closing_the_driver(monkeypatch):
+    """A worker queued behind close() must use the driver that is being
+    closed, never open a fresh one that would outlive close()."""
+    import time
+
+    _patch_driver_factory(monkeypatch)
+    adapter = TypeDBAdapter()
+    first = adapter._get_driver()
+    seen = []
+
+    def queued_work():
+        time.sleep(0.1)  # still queued when close() starts draining
+        seen.append(adapter._get_driver())
+
+    future = adapter._get_executor().submit(queued_work)
+    await adapter.close()
+    future.result()
+
+    assert seen == [first]  # the worker used the pre-existing driver
+    assert adapter._driver is None
+    assert [d.closed for d in _FakeDriver.instances] == [True]  # one driver, closed
+
+
+async def test_no_driver_can_open_while_closing(monkeypatch):
+    """With no driver open, a worker queued behind close() cannot create one
+    and is told the adapter is closing; nothing is left open."""
+    import time
+
+    _patch_driver_factory(monkeypatch)
+    adapter = TypeDBAdapter()
+    errors = []
+
+    def queued_work():
+        time.sleep(0.1)
+        try:
+            adapter._get_driver()
+        except RuntimeError as error:
+            errors.append(str(error))
+
+    future = adapter._get_executor().submit(queued_work)
+    await adapter.close()
+    future.result()
+
+    assert errors == ["TypeDB adapter is closing"]
+    assert _FakeDriver.instances == []
+    assert adapter._get_driver() is not None  # reopens lazily afterwards
+    adapter._close_sync()
+    assert [d.closed for d in _FakeDriver.instances] == [True]
+
+
+def test_close_sync_has_the_same_ordering(monkeypatch):
+    import time
+
+    _patch_driver_factory(monkeypatch)
+    adapter = TypeDBAdapter()
+    first = adapter._get_driver()
+    seen = []
+    future = adapter._get_executor().submit(
+        lambda: (time.sleep(0.1), seen.append(adapter._get_driver()))
+    )
+    adapter._close_sync()
+    future.result()
+    assert seen == [first] and first.closed and adapter._driver is None
+    assert len(_FakeDriver.instances) == 1
